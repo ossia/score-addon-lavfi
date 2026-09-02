@@ -1,0 +1,11 @@
+{
+  "src": "https://github.com/ossia/score-addon-lavfi/releases/latest/download/score-addon-lavfi.zip",
+  "name": "FFmpeg filters",
+  "raw_name": "score-addon-lavfi",
+  "version": "0.1",
+  "kind": "addon",
+  "short": "Run FFmpeg libavfilter graphs on audio and video",
+  "long": "Adds an 'FFmpeg filter' process whose program is a libavfilter graph. Audio effects and analyzers, video filters, generators and audio-to-video visualisers; on the Vulkan backend video frames stay on the GPU.",
+  "small": "https://raw.githubusercontent.com/OSSIA/score-addon-tutorial/master/Deployment/icon.png",
+  "key": "b2a6e2f4-8c1e-4d5c-a1a7-5f0d2e9c3b41"
+}

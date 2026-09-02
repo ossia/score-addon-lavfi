@@ -1,0 +1,5 @@
+build*/
+release/
+*.zip
+.cache/
+compile_commands.json
