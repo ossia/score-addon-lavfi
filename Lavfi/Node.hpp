@@ -1,6 +1,4 @@
 #pragma once
-#include <Process/ExecutionContext.hpp>
-
 #include <Gfx/GfxExecNode.hpp>
 #include <Gfx/Graph/Node.hpp>
 #include <Gfx/Graph/NodeRenderer.hpp>
@@ -25,6 +23,28 @@ class GPUVideoDecoder;
 namespace Lavfi
 {
 class VulkanTransport;
+
+struct MetadataMailbox
+{
+  std::mutex mutex;
+  ossia::value value;
+  bool changed{};
+  void post(ossia::value v)
+  {
+    std::lock_guard lock{mutex};
+    value = std::move(v);
+    changed = true;
+  }
+  bool take(ossia::value& out)
+  {
+    std::lock_guard lock{mutex};
+    if(!changed)
+      return false;
+    changed = false;
+    out = std::move(value);
+    return true;
+  }
+};
 
 /**
  * @brief Render-thread node for graphs with video pads.
@@ -64,10 +84,11 @@ public:
     Lavfi::Description desc;
     std::vector<Lavfi::OptionInfo> controls;
     int sampleRate{48000};
-    /// The execution node's Metadata control-out, written from the render
-    /// thread through the execution queue (the GpuControlOuts pattern).
-    std::shared_ptr<Gfx::exec_control> metadataOut;
-    std::weak_ptr<Execution::ExecutionCommandQueue> queue;
+    /// Latest lavfi.* metadata of the sink frame, render thread -> execution
+    /// thread. The execution node moves it into its Metadata control-out at
+    /// its next tick (Gfx::exec_control is not thread-safe and the execution
+    /// command queue is single-producer, so neither is written from here).
+    std::shared_ptr<MetadataMailbox> metadata;
   };
 
   explicit GfxNode(Program program);
@@ -205,6 +226,5 @@ private:
   AVFrame* m_inputFrame{}; ///< Scratch frame the readbacks are copied into.
   int64_t m_audioPos{};
   bool m_hasOutput{};
-  std::vector<float> m_drainScratch;
 };
 }

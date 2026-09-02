@@ -50,7 +50,7 @@ public:
 
   /// Bumped by the executor on every (re)wiring of the controls; queued
   /// control writes carry the generation they were issued for.
-  int generation{};
+  std::atomic<int> generation{};
 
 private:
   bool rebuild(int sampleRate, const std::vector<int>& inChannels);

@@ -52,8 +52,8 @@ public:
       if(line.isEmpty() || line.startsWith('#'))
         continue;
       if(!graph.isEmpty() && !graph.endsWith(',') && !graph.endsWith(';')
-         && !graph.endsWith('[') && !line.startsWith(',') && !line.startsWith(';')
-         && !line.startsWith('['))
+         && !graph.endsWith('[') && !graph.endsWith(']') && !line.startsWith(',')
+         && !line.startsWith(';') && !line.startsWith('['))
         graph += ',';
       graph += line;
     }

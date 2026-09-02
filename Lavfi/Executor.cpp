@@ -33,13 +33,13 @@ class gfx_node final : public Gfx::gfx_exec_node
 public:
   gfx_node(
       Gfx::GfxExecutionAction& ctx, const Lavfi::Model& model, int sampleRate,
-      QObject* execContext, std::weak_ptr<Execution::ExecutionCommandQueue> queue)
+      QObject* execContext)
       : gfx_exec_node{ctx}
   {
     GfxNode::Program program{
         model.script().toStdString(), model.description(), model.controlOptions(),
         sampleRate};
-    program.queue = std::move(queue);
+    program.metadata = m_metadata;
 
     for(auto* inlet : model.inlets())
     {
@@ -68,7 +68,7 @@ public:
       else if(qobject_cast<Process::AudioOutlet*>(outlet))
         m_outlets.push_back(new ossia::audio_outlet); // audio out of a video graph: silent
       else
-        program.metadataOut = add_control_out();
+        m_metadataOut = add_control_out();
     }
 
     id = exec_context->ui->register_node(std::make_unique<GfxNode>(std::move(program)));
@@ -76,6 +76,25 @@ public:
   using control_type = Gfx::exec_control;
 
   ~gfx_node() override { exec_context->ui->unregister_node(id); }
+
+  void run(const ossia::token_request& tk, ossia::exec_state_facade st) noexcept override
+  {
+    // Metadata posted by the renderer since the last tick, into the
+    // control-out gfx_exec_node::run writes to the outlet.
+    if(m_metadataOut)
+    {
+      ossia::value v;
+      if(m_metadata->take(v))
+      {
+        m_metadataOut->value = std::move(v);
+        m_metadataOut->changed = true;
+      }
+    }
+    gfx_exec_node::run(tk, st);
+  }
+
+  std::shared_ptr<MetadataMailbox> m_metadata = std::make_shared<MetadataMailbox>();
+  std::shared_ptr<control_type> m_metadataOut;
 
   std::string label() const noexcept override { return "lavfi"; }
 };
@@ -105,8 +124,7 @@ std::shared_ptr<ossia::graph_node> ProcessExecutorComponent::makeNode()
     return std::make_shared<audio_node>(
         model.script().toStdString(), model.description(), model.controlOptions(), rate);
   return std::make_shared<gfx_node>(
-      ctx.doc.plugin<Gfx::DocumentPlugin>().exec, model, rate, this,
-      ctx.weakExecutionQueue());
+      ctx.doc.plugin<Gfx::DocumentPlugin>().exec, model, rate, this);
 }
 
 void ProcessExecutorComponent::wireControls(const std::shared_ptr<ossia::graph_node>& n)
@@ -217,6 +235,9 @@ ProcessExecutorComponent::ProcessExecutorComponent(
             std::move(payload->script), std::move(payload->desc),
             std::move(payload->controls));
       });
+      // Same layout, but a control may have changed widget kind (a new
+      // ControlInlet object): reconnect and re-seed them all.
+      wireControls(an);
       return;
     }
 

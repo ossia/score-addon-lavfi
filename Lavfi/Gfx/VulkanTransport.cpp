@@ -316,10 +316,18 @@ bool VulkanTransport::acquireInput(const score::gfx::RenderState& state, int inp
   }
   m->waitFrame(f);
 
-  // Rotate. A `rendered` that was never taken (takeInput not called) is
-  // dropped back to the pool.
+  // Rotate. A `rendered` that was never taken (takeInput not called) goes
+  // back to the pool with the state QRhi left it in, like a taken one.
   if(in.rendered)
+  {
+    auto* rvkf = Impl::vkframe(in.rendered);
+    auto rit = rvkf ? in.wrapped.find(rvkf->img[0]) : in.wrapped.end();
+    m->releaseFrame(
+        in.rendered,
+        rit != in.wrapped.end() ? VkImageLayout(rit->second.texture->nativeTexture().layout)
+                                : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     av_frame_free(&in.rendered);
+  }
   in.rendered = in.current;
   in.current = f;
   if(lavfiVkDebug())

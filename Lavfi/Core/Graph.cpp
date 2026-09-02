@@ -11,6 +11,8 @@ extern "C" {
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/common.h>
+#include <libavcodec/defs.h>
 #include <libavutil/dict.h>
 #include <libavutil/log.h>
 #include <libavutil/mem.h>
@@ -577,8 +579,11 @@ bool Graph::pushAudio(int i, const float* const* planes, int channels, int frame
     if(!in.pool || in.poolFrames < frames)
     {
       av_buffer_pool_uninit(&in.pool);
-      in.poolFrames = std::max(frames, std::max(in.poolFrames * 2, 4096));
-      in.pool = av_buffer_pool_init(in.poolFrames * sizeof(float), nullptr);
+      // Planes padded like FFmpeg's own (FFALIGN(nb_samples, 32) plus the
+      // input padding): SIMD filters may read up to that.
+      in.poolFrames = FFALIGN(std::max(frames, std::max(in.poolFrames * 2, 4096)), 32);
+      in.pool = av_buffer_pool_init(
+          in.poolFrames * sizeof(float) + AV_INPUT_BUFFER_PADDING_SIZE, nullptr);
       if(!in.pool)
         return false;
     }
@@ -680,6 +685,27 @@ AVFrame* Graph::pullVideo(int o)
   }
   collectMetadata(out, *f);
   return f;
+}
+
+int Graph::discardPending(int o)
+{
+  if(o < 0 || o >= int(m_outputs.size()))
+    return 0;
+  Output& out = m_outputs[o];
+  AVFrame* f = out.frame ? out.frame : (out.frame = av_frame_alloc());
+  int n = 0;
+  // Bounded twice: NO_REQUEST means nothing new is produced, and the cap
+  // guards against a sink that answers anyway.
+  while(n < 64)
+  {
+    av_frame_unref(f);
+    const int ret = av_buffersink_get_frame_flags(out.sink, f, AV_BUFFERSINK_FLAG_NO_REQUEST);
+    if(ret < 0)
+      break;
+    n++;
+  }
+  av_frame_unref(f);
+  return n;
 }
 
 int Graph::outputWidth(int o) const noexcept

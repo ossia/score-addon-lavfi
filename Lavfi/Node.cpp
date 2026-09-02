@@ -380,6 +380,10 @@ void GfxRenderer::addOutputPass(
   std::span<const score::gfx::Sampler> samplers;
   if(!currentShaders(vs, fs, samplers))
     return;
+  // RenderList's surgical re-init adds a pass per edge after initState,
+  // which already built them.
+  if(hasOutputPassForEdge(edge))
+    return;
   auto rt = renderer.renderTargetForOutput(edge);
   if(!rt.renderTarget)
     return;
@@ -714,13 +718,10 @@ void GfxRenderer::pushVulkanInputs()
 void GfxRenderer::publishMetadata()
 {
   auto& prog = lavfiNode().program();
-  if(!prog.metadataOut)
+  if(!prog.metadata)
     return;
   const auto& md = m_graph->lastMetadata(0);
   if(md.empty())
-    return;
-  auto q = prog.queue.lock();
-  if(!q)
     return;
   std::vector<ossia::value> list;
   list.reserve(md.size());
@@ -732,10 +733,7 @@ void GfxRenderer::publishMetadata()
                                                                           : ossia::value{v};
     list.push_back(std::vector<ossia::value>{k, std::move(val)});
   }
-  q->enqueue([v = ossia::value{std::move(list)}, port = prog.metadataOut]() mutable {
-    std::swap(port->value, v);
-    port->changed = true;
-  });
+  prog.metadata->post(ossia::value{std::move(list)});
 }
 
 void GfxRenderer::drainUnusedOutputs()
@@ -743,25 +741,11 @@ void GfxRenderer::drainUnusedOutputs()
   // Only the first video output is displayed. Anything else the graph
   // produces (a second video pad, ebur128's default video output, the audio
   // of an audio+video graph) would otherwise pile up in its sink forever.
+  // Request-free: a source-fed extra output would otherwise produce a frame
+  // per request, forever.
   const int n = m_graph->outputCount();
   for(int o = 1; o < n; o++)
-  {
-    if(m_graph->outputType(o) == AVMEDIA_TYPE_VIDEO)
-    {
-      while(AVFrame* f = m_graph->pullVideo(o))
-        av_frame_free(&f);
-    }
-    else
-    {
-      const int ch = std::max(1, m_graph->outputChannels(o));
-      m_drainScratch.resize(std::size_t(ch) * 1024);
-      std::vector<float*> planes(ch);
-      for(int c = 0; c < ch; c++)
-        planes[c] = m_drainScratch.data() + std::size_t(c) * 1024;
-      while(m_graph->pullAudio(o, planes.data(), ch, 1024) > 0)
-        ;
-    }
-  }
+    m_graph->discardPending(o);
 }
 
 void GfxRenderer::update(

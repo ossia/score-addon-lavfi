@@ -177,6 +177,10 @@ public:
   AVPixelFormat outputPixelFormat(int o) const noexcept;
   AVBufferRef* outputHwFramesContext(int o) const noexcept;
   bool eof() const noexcept { return m_eof; }
+  /// Drop whatever output @p o has already produced, without asking the graph
+  /// for more (AV_BUFFERSINK_FLAG_NO_REQUEST): a source-fed output would
+  /// otherwise produce forever. Returns the number of frames dropped.
+  int discardPending(int o);
 
   // ---- runtime control ---------------------------------------------------
   /// avfilter_graph_send_command(target, cmd, arg). target is a filter
