@@ -1,0 +1,2 @@
+# Equirectangular to flat with a virtual camera; yaw/pitch/roll are runtime controls.
+v360_vulkan=input=e:output=flat:yaw=0:pitch=0:roll=0:h_fov=90:v_fov=60

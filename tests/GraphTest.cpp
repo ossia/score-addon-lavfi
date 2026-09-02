@@ -10,6 +10,7 @@
 #include <vector>
 
 extern "C" {
+#include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
 }
 
@@ -203,6 +204,109 @@ static void test_video_source()
   }
 }
 
+// Hardware graphs through the wrapper alone (FFmpeg's own device, no QRhi):
+// exercises hw_device_ctx propagation to hwupload & friends before their
+// init, the CPU<->GPU stages inside a graph, and the Vulkan->CUDA transfer.
+static void test_hw_graph(const char* devname, const char* script, bool expectCuda)
+{
+  const AVHWDeviceType type = av_hwdevice_find_type_by_name(devname);
+  if(type == AV_HWDEVICE_TYPE_NONE)
+  {
+    std::printf("  skip: no %s support in this FFmpeg\n", devname);
+    return;
+  }
+  AVBufferRef* dev = nullptr;
+  if(av_hwdevice_ctx_create(&dev, type, nullptr, nullptr, 0) < 0)
+  {
+    std::printf("  skip: no %s device on this machine\n", devname);
+    return;
+  }
+  if(expectCuda && av_hwdevice_find_type_by_name("cuda") == AV_HWDEVICE_TYPE_NONE)
+  {
+    std::printf("  skip: no cuda support in this FFmpeg\n");
+    av_buffer_unref(&dev);
+    return;
+  }
+  Lavfi::Graph g;
+  std::vector<Lavfi::InputConfig> in(1);
+  in[0].type = AVMEDIA_TYPE_VIDEO;
+  in[0].video.width = 32;
+  in[0].video.height = 16;
+  in[0].video.format = AV_PIX_FMT_RGBA;
+  Lavfi::SinkConfig sinks;
+  sinks.pix_fmts = {AV_PIX_FMT_RGBA};
+  std::string err;
+  const bool ok = g.init(script, in, sinks, dev, err);
+  std::printf("  %s: %s\n", script, ok ? "configured" : err.c_str());
+  CHECK(ok);
+  if(ok)
+  {
+    AVFrame* f = av_frame_alloc();
+    f->format = AV_PIX_FMT_RGBA;
+    f->width = 32;
+    f->height = 16;
+    CHECK(av_frame_get_buffer(f, 0) >= 0);
+    for(int y = 0; y < 16; y++)
+      for(int x = 0; x < 32; x++)
+      {
+        uint8_t* px = f->data[0] + y * f->linesize[0] + x * 4;
+        px[0] = uint8_t(x * 8);
+        px[1] = 100;
+        px[2] = 200;
+        px[3] = 255;
+      }
+    f->pts = 0;
+    CHECK(g.pushVideo(0, f));
+    AVFrame* o = g.pullVideo(0);
+    CHECK(o != nullptr);
+    if(o)
+    {
+      CHECK(o->format == AV_PIX_FMT_RGBA);
+      // hflip: the first pixel is the input's last one (x=31 -> R=248).
+      const uint8_t* px = o->data[0];
+      CHECK(std::abs(int(px[0]) - 248) <= 2 && std::abs(int(px[1]) - 100) <= 2);
+      av_frame_free(&o);
+    }
+    av_frame_free(&f);
+  }
+  av_buffer_unref(&dev);
+}
+
+static void test_hw_graphs()
+{
+  // Vulkan filter between hwupload/hwdownload.
+  test_hw_graph("vulkan", "hwupload,hflip_vulkan,hwdownload,format=rgba", false);
+  // CUDA filters around a CPU frame; scale_cuda takes 0RGB32/0BGR32
+  // (rgb0/bgr0), not rgba, and hwdownload yields the frame's sw_format, so
+  // the conversion back to rgba is left to the sink negotiation.
+  test_hw_graph("cuda", "format=rgb0,hwupload_cuda,scale_cuda=32:16,hwdownload,format=rgb0,hflip", true);
+  // Informational: a CUDA stage inside a Vulkan graph. hwupload only takes
+  // software frames or its own device's format, so FFmpeg's Vulkan<->CUDA
+  // transfer is not reachable from a filter string (checked on 6.1); if a
+  // future FFmpeg allows it this starts printing "configured".
+  {
+    AVBufferRef* dev = nullptr;
+    if(av_hwdevice_find_type_by_name("vulkan") != AV_HWDEVICE_TYPE_NONE
+       && av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_VULKAN, nullptr, nullptr, 0) >= 0)
+    {
+      Lavfi::Graph g;
+      std::vector<Lavfi::InputConfig> in(1);
+      in[0].type = AVMEDIA_TYPE_VIDEO;
+      in[0].video.width = 32;
+      in[0].video.height = 16;
+      in[0].video.format = AV_PIX_FMT_RGBA;
+      Lavfi::SinkConfig sinks;
+      sinks.pix_fmts = {AV_PIX_FMT_RGBA};
+      std::string err;
+      const bool ok = g.init(
+          "format=rgb0,hwupload,hwupload=derive_device=cuda,scale_cuda=32:16,hwupload,hwdownload",
+          in, sinks, dev, err);
+      std::printf("  info: CUDA stage inside a Vulkan graph: %s\n", ok ? "configured" : "refused (expected)");
+      av_buffer_unref(&dev);
+    }
+  }
+}
+
 static void test_log_capture()
 {
   Lavfi::Graph g;
@@ -224,6 +328,7 @@ int main()
   test_audio_lookahead_reports_shortfall();
   test_video_roundtrip_and_metadata();
   test_video_source();
+  test_hw_graphs();
   test_log_capture();
   std::printf(
       "lavfi graph tests: %s (%d failure%s); vulkan filters: %s, cuda: %s, libplacebo: %s\n",

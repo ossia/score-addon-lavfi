@@ -1,0 +1,2 @@
+# Audio in, video out.
+showspectrum=size=1024x512:mode=combined:color=intensity:slide=scroll

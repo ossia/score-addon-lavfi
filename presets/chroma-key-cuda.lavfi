@@ -1,0 +1,3 @@
+# Chroma key on NVIDIA through CUDA: CPU frame in, CUDA filter, CPU frame out.
+# (yuv420p is what chromakey_cuda takes; the node converts on the GPU on upload.)
+format=yuv420p,hwupload_cuda,chromakey_cuda=color=0x00FF00:similarity=0.3:blend=0.1,hwdownload,format=yuv420p

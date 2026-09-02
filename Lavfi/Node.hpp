@@ -6,6 +6,10 @@
 #include <Lavfi/Core/Graph.hpp>
 #include <Video/VideoInterface.hpp>
 
+extern "C" {
+#include <libavutil/hwcontext.h>
+}
+
 #include <mutex>
 #include <string>
 #include <vector>
@@ -17,6 +21,8 @@ class GPUVideoDecoder;
 
 namespace Lavfi
 {
+class VulkanTransport;
+
 /**
  * @brief Render-thread node for graphs with video pads.
  *
@@ -25,15 +31,24 @@ namespace Lavfi
  * texture outlet. Control values and audio arrive as messages from the
  * execution node and are handed to the renderer at its next update.
  *
- * Frame transport (chosen per renderer at init):
- *  - CPU: each texture input is rendered into an RGBA8 render target, read
- *    back asynchronously (one frame of latency, no GPU stall), copied into
- *    an AVFrame and pushed; the sink frame, in whichever pixel format the
- *    graph settled on among those score's GPU decoders can upload, goes
- *    through score::gfx::createGPUVideoDecoder, which uploads and colour-
- *    converts on the GPU. Works on every QRhi backend.
- *  - Vulkan (next phase, see PLAN.md): the render target IS an FFmpeg pool
- *    image and the sink image is sampled directly; no readback, no upload.
+ * Frame transport, chosen per renderer at init (SCORE_LAVFI_TRANSPORT=auto|
+ * vulkan|cpu overrides, SCORE_LAVFI_DEBUG=1 logs the choice):
+ *
+ *  - Vulkan (Lavfi::VulkanTransport): on the Vulkan backend with score's shared
+ *    VkDevice, the input render targets are FFmpeg pool images and the sink
+ *    frame is sampled directly. Zero copies; the graph's filters must accept
+ *    Vulkan frames (`*_vulkan`, `libplacebo`, `hwupload`/`hwdownload` inside
+ *    the string for CPU or CUDA stages). If the graph refuses Vulkan frames
+ *    the renderer falls back to the CPU transport.
+ *
+ *  - CPU: each texture input is rendered into an RGBA8 render target, read back
+ *    asynchronously (one frame of latency, no GPU stall), copied into an
+ *    AVFrame and pushed; the sink frame, in whichever pixel format the graph
+ *    settled on among those score's GPU decoders upload, goes through
+ *    score::gfx::createGPUVideoDecoder (GPU colour conversion on upload). The
+ *    graph still gets a hardware device (Vulkan, D3D11, VideoToolbox or CUDA,
+ *    Lavfi::preferredDeviceForRhi) so `hwupload,...,hwdownload` stages work on
+ *    every backend.
  */
 class GfxNode final : public score::gfx::NodeModel
 {
@@ -43,6 +58,7 @@ public:
     std::string script;
     Lavfi::Description desc;
     std::vector<Lavfi::OptionInfo> controls;
+    int sampleRate{48000};
   };
 
   explicit GfxNode(Program program);
@@ -56,7 +72,6 @@ public:
   /// Index of a port in the exec node's inlet list -> which control (or -1).
   int controlIndex(int32_t port) const noexcept;
 
-  // Read by the renderers under m_mutex.
   const Program& program() const noexcept { return m_program; }
   std::vector<std::pair<int, ossia::value>> takePendingControls();
   std::vector<std::pair<int, ossia::audio_vector>> takePendingAudio();
@@ -77,6 +92,14 @@ public:
   explicit GfxRenderer(const GfxNode& node) noexcept;
   ~GfxRenderer() override;
 
+  enum class Transport
+  {
+    None,
+    Cpu,
+    Vulkan
+  };
+  Transport transport() const noexcept { return m_transport; }
+
   score::gfx::TextureRenderTarget renderTargetForInput(const score::gfx::Port& p) override;
   void inputAboutToFinish(
       score::gfx::RenderList& renderer, const score::gfx::Port& p,
@@ -94,27 +117,44 @@ private:
   struct Input
   {
     const score::gfx::Port* port{};
+    int graphInput{};  ///< index among the graph's inputs
+    int vkInput{-1};   ///< index in the Vulkan transport
+    QSize size;
+    // CPU transport
     score::gfx::TextureRenderTarget rt;
     QRhiReadbackResult readback;
-    int graphInput{}; ///< index among the graph's inputs
   };
 
+  Transport chooseTransport(score::gfx::RenderList& renderer) const;
+  bool setupTransport(score::gfx::RenderList& renderer, Transport t);
+  void releaseTransport(score::gfx::RenderList& renderer);
   bool buildGraph(score::gfx::RenderList& renderer);
+  bool setupOutputPass(score::gfx::RenderList& renderer);
   bool setupDecoder(score::gfx::RenderList& renderer, AVPixelFormat fmt, int w, int h);
+  void rebuildPasses(score::gfx::RenderList& renderer);
   void pushReadbacks(score::gfx::RenderList& renderer);
+  void pushVulkanInputs();
   void pushAudio();
   void applyControls();
+  bool inputSizesChanged() const;
 
   const GfxNode& lavfiNode() const noexcept { return static_cast<const GfxNode&>(node); }
 
+  Transport m_transport{Transport::None};
   std::unique_ptr<Lavfi::Graph> m_graph;
   std::string m_error;
   std::vector<Input> m_inputs;
-  std::vector<int> m_audioInputs; ///< graph input index per audio inlet, in exec order
   int64_t m_frameCounter{};
   bool m_flipY{};
+  AVBufferRef* m_hwDevice{}; ///< handed to the graph's filters (any transport)
+  AVHWDeviceType m_hwDeviceType{AV_HWDEVICE_TYPE_NONE};
+  bool m_vulkanRefused{}; ///< the graph would not take Vulkan frames: stay on CPU
 
-  // Output side: score's video upload path.
+  // Vulkan transport
+  std::unique_ptr<VulkanTransport> m_vk;
+  QRhiSampler* m_vkSampler{};
+
+  // CPU transport output: score's video upload path.
   Video::ImageFormat m_format{};
   std::unique_ptr<score::gfx::GPUVideoDecoder> m_decoder;
   std::pair<QShader, QShader> m_shaders;
@@ -129,8 +169,7 @@ private:
   AVFrame* m_frames[3]{};
   int m_frameSlot{};
   AVFrame* m_inputFrame{}; ///< Scratch frame the readbacks are copied into.
-  std::vector<ossia::audio_vector> m_audio;
-  int m_sampleRate{48000};
   int64_t m_audioPos{};
+  bool m_hasOutput{};
 };
 }

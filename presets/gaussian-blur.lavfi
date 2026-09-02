@@ -1,0 +1,2 @@
+# Gaussian blur on the CPU: works on every backend.
+gblur=sigma=4

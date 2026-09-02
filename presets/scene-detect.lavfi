@@ -1,0 +1,2 @@
+# Scene change score on the Metadata outlet (scd.score, scd.mafd).
+scdet=threshold=10

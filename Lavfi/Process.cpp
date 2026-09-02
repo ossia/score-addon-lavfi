@@ -38,6 +38,13 @@ EffectProcessFactory_T<Lavfi::Model>::descriptor(QString txt) const noexcept
   d.tags = QStringList{"ffmpeg", "lavfi"};
   return d;
 }
+
+template <>
+Process::Descriptor EffectProcessFactory_T<Lavfi::Model>::descriptor(
+    const Process::ProcessModel& d) const noexcept
+{
+  return descriptor(static_cast<const Lavfi::Model&>(d).script());
+}
 }
 
 namespace Lavfi

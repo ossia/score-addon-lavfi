@@ -100,4 +100,8 @@ QString EffectProcessFactory_T<Lavfi::Model>::customConstructionData() const noe
 template <>
 Process::Descriptor
 EffectProcessFactory_T<Lavfi::Model>::descriptor(QString d) const noexcept;
+
+template <>
+Process::Descriptor EffectProcessFactory_T<Lavfi::Model>::descriptor(
+    const Process::ProcessModel& d) const noexcept;
 }

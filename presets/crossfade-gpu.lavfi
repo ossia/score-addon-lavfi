@@ -1,0 +1,2 @@
+# Two inputs [a] and [b], crossfade on the GPU; offset/duration in seconds.
+[a][b]xfade_vulkan=transition=fade:duration=1:offset=0

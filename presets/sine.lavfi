@@ -1,0 +1,2 @@
+# A generator: no input. frequency is a runtime control.
+sine=frequency=440:sample_rate=48000

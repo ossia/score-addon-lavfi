@@ -1,0 +1,2 @@
+# Non-local means denoiser on the GPU (Vulkan).
+nlmeans_vulkan=s=4:p=3:r=7

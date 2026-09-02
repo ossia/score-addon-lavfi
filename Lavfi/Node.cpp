@@ -5,6 +5,8 @@
 #include <Gfx/Graph/decoders/GPUVideoDecoder.hpp>
 #include <Gfx/Graph/decoders/GPUVideoDecoderFactory.hpp>
 #include <Lavfi/AudioNode.hpp>
+#include <Lavfi/Gfx/HwDevice.hpp>
+#include <Lavfi/Gfx/VulkanTransport.hpp>
 
 #include <score/tools/Debug.hpp>
 
@@ -13,11 +15,19 @@
 #include <cstring>
 
 extern "C" {
+#include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/pixdesc.h>
 }
 
 namespace Lavfi
 {
+static bool lavfiDebug()
+{
+  static const bool on = qEnvironmentVariableIsSet("SCORE_LAVFI_DEBUG");
+  return on;
+}
+
 // ---------------------------------------------------------------------------
 //  GfxNode
 // ---------------------------------------------------------------------------
@@ -122,8 +132,13 @@ score::gfx::TextureRenderTarget
 GfxRenderer::renderTargetForInput(const score::gfx::Port& p)
 {
   for(auto& in : m_inputs)
-    if(in.port == &p)
-      return in.rt;
+  {
+    if(in.port != &p)
+      continue;
+    if(m_transport == Transport::Vulkan && m_vk)
+      return m_vk->renderTargetForInput(in.vkInput);
+    return in.rt;
+  }
   return {};
 }
 
@@ -131,6 +146,8 @@ void GfxRenderer::inputAboutToFinish(
     score::gfx::RenderList& renderer, const score::gfx::Port& p,
     QRhiResourceUpdateBatch*& res)
 {
+  if(m_transport != Transport::Cpu)
+    return;
   for(auto& in : m_inputs)
   {
     if(in.port != &p || !in.rt.texture)
@@ -151,10 +168,97 @@ static const std::vector<AVPixelFormat> uploadableFormats{
     AV_PIX_FMT_GRAY8,   AV_PIX_FMT_YUV420P10, AV_PIX_FMT_YUV444P10, AV_PIX_FMT_RGBA64,
     AV_PIX_FMT_GBRP,    AV_PIX_FMT_GBRAP};
 
+GfxRenderer::Transport GfxRenderer::chooseTransport(score::gfx::RenderList& renderer) const
+{
+  const QByteArray env = qgetenv("SCORE_LAVFI_TRANSPORT").toLower();
+  if(env == "cpu")
+    return Transport::Cpu;
+  if(m_vulkanRefused)
+    return Transport::Cpu;
+  if(env == "vulkan" || env.isEmpty() || env == "auto")
+    if(VulkanTransport::available(*renderer.state.rhi))
+      return Transport::Vulkan;
+  return Transport::Cpu;
+}
+
+bool GfxRenderer::setupTransport(score::gfx::RenderList& renderer, Transport t)
+{
+  releaseTransport(renderer);
+  auto& rhi = *renderer.state.rhi;
+  auto& n = lavfiNode();
+
+  if(t == Transport::Vulkan)
+  {
+    AVBufferRef* dev = vulkanDeviceForRhi(rhi);
+    if(!dev)
+      return false;
+    m_vk = std::make_unique<VulkanTransport>();
+    const bool ok = m_vk->init(renderer.state, dev);
+    av_buffer_unref(&dev);
+    if(!ok)
+    {
+      m_vk.reset();
+      return false;
+    }
+    for(auto& in : m_inputs)
+    {
+      in.vkInput = m_vk->addInput(in.size);
+      if(in.vkInput < 0)
+      {
+        m_vk->release();
+        m_vk.reset();
+        return false;
+      }
+    }
+    m_vkSampler = rhi.newSampler(
+        QRhiSampler::Linear, QRhiSampler::Linear, QRhiSampler::None, QRhiSampler::ClampToEdge,
+        QRhiSampler::ClampToEdge);
+    m_vkSampler->create();
+    m_transport = Transport::Vulkan;
+  }
+  else
+  {
+    // One render target per texture input, sized like any other 2D input port.
+    for(auto& in : m_inputs)
+    {
+      in.rt = score::gfx::createRenderTarget(
+          renderer.state, QRhiTexture::RGBA8, in.size, renderer.samples(), false, false,
+          QRhiTexture::UsedAsTransferSource);
+      if(!in.rt.texture)
+        return false;
+    }
+    m_inputFrame = av_frame_alloc();
+    m_transport = Transport::Cpu;
+  }
+  (void)n;
+  return true;
+}
+
+void GfxRenderer::releaseTransport(score::gfx::RenderList& renderer)
+{
+  if(m_vk)
+  {
+    m_vk->release();
+    m_vk.reset();
+  }
+  delete m_vkSampler;
+  m_vkSampler = nullptr;
+  for(auto& in : m_inputs)
+  {
+    in.rt.release();
+    in.rt = {};
+    in.vkInput = -1;
+    in.readback = {};
+  }
+  av_frame_free(&m_inputFrame);
+  m_transport = Transport::None;
+}
+
 bool GfxRenderer::buildGraph(score::gfx::RenderList& renderer)
 {
   auto& n = lavfiNode();
   const auto& prog = n.program();
+  const bool vulkan = m_transport == Transport::Vulkan;
 
   std::vector<Lavfi::InputConfig> inputs;
   std::size_t video = 0;
@@ -164,44 +268,121 @@ bool GfxRenderer::buildGraph(score::gfx::RenderList& renderer)
     cfg.type = pad.type;
     if(pad.type == AVMEDIA_TYPE_VIDEO)
     {
-      if(video >= m_inputs.size() || !m_inputs[video].rt.texture)
+      if(video >= m_inputs.size())
         return false;
-      const QSize sz = m_inputs[video].rt.texture->pixelSize();
-      cfg.video.width = sz.width();
-      cfg.video.height = sz.height();
-      cfg.video.format = AV_PIX_FMT_RGBA;
+      auto& in = m_inputs[video++];
+      cfg.video.width = in.size.width();
+      cfg.video.height = in.size.height();
       cfg.video.time_base = {1, 1000000};
       cfg.video.frame_rate = {60, 1};
-      video++;
+      if(vulkan)
+      {
+        cfg.video.format = AV_PIX_FMT_VULKAN;
+        cfg.video.hw_frames_ctx = m_vk->inputFramesContext(in.vkInput);
+      }
+      else
+        cfg.video.format = AV_PIX_FMT_RGBA;
     }
     else
     {
-      cfg.audio.sample_rate = m_sampleRate;
+      cfg.audio.sample_rate = prog.sampleRate;
       cfg.audio.channels = 2;
     }
     inputs.push_back(cfg);
   }
 
   Lavfi::SinkConfig sinks;
-  sinks.pix_fmts = uploadableFormats;
-  sinks.sample_rate = m_sampleRate;
+  sinks.pix_fmts = vulkan ? std::vector<AVPixelFormat>{AV_PIX_FMT_VULKAN} : uploadableFormats;
+  sinks.sample_rate = prog.sampleRate;
   sinks.threads = 0; // slice threading for the CPU filters
 
   auto g = std::make_unique<Lavfi::Graph>();
   std::string err;
-  if(!g->init(prog.script, inputs, sinks, nullptr, err))
+  if(!g->init(prog.script, inputs, sinks, m_hwDevice, err))
   {
     m_error = err;
-    qDebug() << "lavfi: graph configuration failed:" << QString::fromStdString(err);
+    if(lavfiDebug() || !vulkan)
+      qDebug() << "lavfi: graph configuration failed (" << (vulkan ? "vulkan" : "cpu")
+               << "):" << QString::fromStdString(err);
     return false;
+  }
+  if(vulkan)
+  {
+    // The sink must give single-plane RGBA-order frames to be sampled as is.
+    AVBufferRef* hw = g->outputHwFramesContext(0);
+    const auto* fc = hw ? reinterpret_cast<AVHWFramesContext*>(hw->data) : nullptr;
+    const AVPixelFormat sw = fc ? fc->sw_format : AV_PIX_FMT_NONE;
+    if(g->outputPixelFormat(0) != AV_PIX_FMT_VULKAN
+       || !(sw == AV_PIX_FMT_RGBA || sw == AV_PIX_FMT_BGRA || sw == AV_PIX_FMT_RGB0
+            || sw == AV_PIX_FMT_BGR0))
+    {
+      m_error = std::string("Vulkan sink format not samplable: ")
+                + (sw != AV_PIX_FMT_NONE ? av_get_pix_fmt_name(sw) : "?");
+      if(lavfiDebug())
+        qDebug() << "lavfi:" << QString::fromStdString(m_error);
+      return false;
+    }
   }
   m_graph = std::move(g);
   m_error.clear();
   m_frameCounter = 0;
   m_audioPos = 0;
-  if(qEnvironmentVariableIsSet("SCORE_LAVFI_DEBUG"))
-    qDebug() << "lavfi: transport=cpu sink=" << av_get_pix_fmt_name(m_graph->outputPixelFormat(0))
-             << m_graph->outputWidth(0) << "x" << m_graph->outputHeight(0);
+  m_hasOutput = false;
+  if(lavfiDebug())
+    qDebug() << "lavfi: transport=" << (vulkan ? "vulkan" : "cpu")
+             << "device=" << deviceTypeName(m_hwDeviceType)
+             << "sink=" << av_get_pix_fmt_name(m_graph->outputPixelFormat(0))
+             << m_graph->outputWidth(0) << "x" << m_graph->outputHeight(0)
+             << "filters=" << m_graph->description().filters.size();
+  return true;
+}
+
+void GfxRenderer::rebuildPasses(score::gfx::RenderList& renderer)
+{
+  for(auto& [edge, pass] : m_p)
+    pass.release();
+  m_p.clear();
+  if(this->node.output.empty())
+    return;
+  if(m_transport == Transport::Vulkan)
+    score::gfx::defaultPassesInit(
+        m_p, this->node.output[0]->edges, renderer, renderer.defaultQuad(), m_vertexS,
+        m_fragmentS, m_processUBO, m_materialUBO, m_samplers);
+  else if(m_decoder)
+    score::gfx::defaultPassesInit(
+        m_p, this->node.output[0]->edges, renderer, renderer.defaultQuad(), m_shaders.first,
+        m_shaders.second, m_processUBO, m_materialUBO, m_decoder->samplers);
+}
+
+bool GfxRenderer::setupOutputPass(score::gfx::RenderList& renderer)
+{
+  // Vulkan transport: a passthrough pass sampling the sink image. The
+  // texture object is created by the transport on first present; until then
+  // sample the renderer's empty texture so the bindings are complete.
+  QString frag = QString(R"_(#version 450
+
+)_" SCORE_GFX_VIDEO_UNIFORMS R"_(
+
+layout(binding=3) uniform sampler2D y_tex;
+layout(location = 0) in vec2 v_texcoord;
+layout(location = 0) out vec4 fragColor;
+
+void main()
+{
+  fragColor = texture(y_tex, v_texcoord)%1;
+}
+)_");
+  const bool bgra = m_vk && (m_vk->outputSwFormat() == AV_PIX_FMT_BGRA
+                             || m_vk->outputSwFormat() == AV_PIX_FMT_BGR0);
+  frag = frag.arg(bgra ? ".bgra" : "");
+  std::tie(m_vertexS, m_fragmentS) = score::gfx::makeShaders(
+      renderer.state, score::gfx::GPUVideoDecoder::vertexShader(), frag);
+  if(!m_vertexS.isValid() || !m_fragmentS.isValid())
+    return false;
+  m_samplers.clear();
+  QRhiTexture* tex = m_vk ? m_vk->outputTexture() : nullptr;
+  m_samplers.push_back({m_vkSampler, tex ? tex : &renderer.emptyTexture()});
+  rebuildPasses(renderer);
   return true;
 }
 
@@ -212,10 +393,6 @@ bool GfxRenderer::setupDecoder(score::gfx::RenderList& renderer, AVPixelFormat f
     m_decoder->release(renderer);
     m_decoder.reset();
   }
-  for(auto& [edge, pass] : m_p)
-    pass.release();
-  m_p.clear();
-
   m_format = {};
   m_format.width = w;
   m_format.height = h;
@@ -225,15 +402,13 @@ bool GfxRenderer::setupDecoder(score::gfx::RenderList& renderer, AVPixelFormat f
   if(!m_decoder)
   {
     qDebug() << "lavfi: no GPU upload path for" << av_get_pix_fmt_name(fmt);
+    rebuildPasses(renderer);
     return false;
   }
   m_shaders = m_decoder->init(renderer);
   if(!m_shaders.first.isValid() || !m_shaders.second.isValid())
     return false;
-
-  score::gfx::defaultPassesInit(
-      m_p, this->node.output[0]->edges, renderer, renderer.defaultQuad(), m_shaders.first,
-      m_shaders.second, m_processUBO, m_materialUBO, m_decoder->samplers);
+  rebuildPasses(renderer);
   return true;
 }
 
@@ -247,11 +422,9 @@ void GfxRenderer::init(score::gfx::RenderList& renderer, QRhiResourceUpdateBatch
   m_materialUBO = rhi.newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, sizeof(Material));
   m_materialUBO->setName("Lavfi::GfxRenderer::m_materialUBO");
   m_materialUBO->create();
-
   m_flipY = rhi.isYUpInFramebuffer();
-  m_sampleRate = int(n.standardUBO.sampleRate) > 0 ? int(n.standardUBO.sampleRate) : 48000;
 
-  // One render target per texture input, sized like any other 2D input port.
+  // Inputs: sizes as resolved for any other 2D input port.
   m_inputs.clear();
   int graphInput = 0;
   for(std::size_t i = 0; i < n.input.size(); i++)
@@ -266,15 +439,47 @@ void GfxRenderer::init(score::gfx::RenderList& renderer, QRhiResourceUpdateBatch
     Input in;
     in.port = port;
     in.graphInput = graphInput++;
-    const auto spec = n.resolveRenderTargetSpecs(int32_t(i), renderer);
-    in.rt = score::gfx::createRenderTarget(
-        renderer.state, QRhiTexture::RGBA8, spec.size, renderer.samples(), false, false,
-        QRhiTexture::UsedAsTransferSource);
+    in.size = n.resolveRenderTargetSpecs(int32_t(i), renderer).size;
+    if(in.size.isEmpty())
+      in.size = renderer.state.renderSize;
     m_inputs.push_back(std::move(in));
   }
-  m_inputFrame = av_frame_alloc();
 
-  if(buildGraph(renderer))
+  // Hardware device for the graph's filters, whatever the transport.
+  av_buffer_unref(&m_hwDevice);
+  m_hwDevice = preferredDeviceForRhi(rhi, &m_hwDeviceType);
+
+  // Transport ladder: Vulkan when possible and accepted by the graph, else CPU.
+  Transport t = chooseTransport(renderer);
+  if(t == Transport::Vulkan)
+  {
+    if(!setupTransport(renderer, Transport::Vulkan) || !buildGraph(renderer))
+    {
+      if(lavfiDebug())
+        qDebug() << "lavfi: Vulkan transport refused, falling back to CPU";
+      m_vulkanRefused = true;
+      m_graph.reset();
+      t = Transport::Cpu;
+    }
+  }
+  if(t == Transport::Cpu)
+  {
+    if(!setupTransport(renderer, Transport::Cpu))
+      return;
+    buildGraph(renderer);
+  }
+  if(m_transport == Transport::Vulkan)
+  {
+    if(m_hwDeviceType != AV_HWDEVICE_TYPE_VULKAN)
+    {
+      // The frames live on the Vulkan device: the graph's filters must too.
+      av_buffer_unref(&m_hwDevice);
+      m_hwDevice = m_vk->device() ? av_buffer_ref(m_vk->device()) : nullptr;
+      m_hwDeviceType = AV_HWDEVICE_TYPE_VULKAN;
+    }
+    setupOutputPass(renderer);
+  }
+  else if(m_graph)
     setupDecoder(
         renderer, m_graph->outputPixelFormat(0), m_graph->outputWidth(0),
         m_graph->outputHeight(0));
@@ -362,36 +567,89 @@ void GfxRenderer::pushReadbacks(score::gfx::RenderList& renderer)
   m_frameCounter++;
 }
 
+void GfxRenderer::pushVulkanInputs()
+{
+  // Frames acquired for the previous render frame were rendered into and
+  // submitted at its endFrame: hand them over, then acquire this frame's.
+  for(auto& in : m_inputs)
+  {
+    if(AVFrame* f = m_vk->takeInput(in.vkInput))
+    {
+      f->pts = m_frameCounter;
+      m_graph->pushVideo(in.graphInput, f);
+      av_frame_free(&f);
+    }
+  }
+  m_frameCounter++;
+}
+
+bool GfxRenderer::inputSizesChanged() const
+{
+  for(auto& in : m_inputs)
+  {
+    if(m_transport == Transport::Cpu && in.rt.texture && in.rt.texture->pixelSize() != in.size)
+      return true;
+  }
+  return false;
+}
+
 void GfxRenderer::update(
     score::gfx::RenderList& renderer, QRhiResourceUpdateBatch& res, score::gfx::Edge* edge)
 {
   auto& n = lavfiNode();
   res.updateDynamicBuffer(m_processUBO, 0, sizeof(score::gfx::ProcessUBO), &n.standardUBO);
 
-  // Input size changes (upstream resolution change) rebuild the graph.
-  bool sizeChanged = false;
-  for(auto& in : m_inputs)
+  if(!m_graph)
   {
-    if(!in.rt.texture || !m_graph)
-      continue;
-    const auto& cfg = m_graph->inputConfig(in.graphInput);
-    const QSize sz = in.rt.texture->pixelSize();
-    if(sz.width() != cfg.video.width || sz.height() != cfg.video.height)
-      sizeChanged = true;
-  }
-  if(!m_graph || sizeChanged)
-  {
+    if(m_transport == Transport::None)
+      return;
+    // Retry a failed configuration (e.g. an input that had no size yet).
     if(!buildGraph(renderer))
       return;
-    setupDecoder(
-        renderer, m_graph->outputPixelFormat(0), m_graph->outputWidth(0),
-        m_graph->outputHeight(0));
+    if(m_transport == Transport::Vulkan)
+      setupOutputPass(renderer);
+    else
+      setupDecoder(
+          renderer, m_graph->outputPixelFormat(0), m_graph->outputWidth(0),
+          m_graph->outputHeight(0));
   }
-  if(!m_graph || !m_decoder)
+  if(!m_graph)
     return;
 
   applyControls();
   pushAudio();
+
+  if(m_transport == Transport::Vulkan)
+  {
+    pushVulkanInputs();
+    // Acquire the images this render frame's passes will draw into.
+    for(auto& in : m_inputs)
+      m_vk->acquireInput(renderer.state, in.vkInput);
+
+    if(AVFrame* f = m_graph->pullVideo(0))
+    {
+      QRhiTexture* prev = m_vk->outputTexture();
+      QRhiTexture* tex = m_vk->presentOutput(renderer.state, f);
+      if(!tex)
+        return;
+      if(tex != prev || !m_hasOutput)
+      {
+        // First frame, or the texture object was recreated (size change):
+        // point the bindings at it. Later frames only bump its generation.
+        m_samplers.clear();
+        m_samplers.push_back({m_vkSampler, tex});
+        rebuildPasses(renderer);
+      }
+      m_hasOutput = true;
+      Material mat;
+      mat.tex_w = float(f->width);
+      mat.tex_h = float(f->height);
+      res.updateDynamicBuffer(m_materialUBO, 0, sizeof(Material), &mat);
+    }
+    return;
+  }
+
+  // --- CPU transport ---------------------------------------------------------
   pushReadbacks(renderer);
 
   // A source graph (no inputs) produces on demand; an effect graph produces
@@ -399,7 +657,7 @@ void GfxRenderer::update(
   // so the graph's own frame rate cannot run ahead of the renderer.
   if(AVFrame* f = m_graph->pullVideo(0))
   {
-    if(f->width != m_format.width || f->height != m_format.height
+    if(!m_decoder || f->width != m_format.width || f->height != m_format.height
        || f->format != m_format.pixel_format)
     {
       if(!setupDecoder(renderer, AVPixelFormat(f->format), f->width, f->height))
@@ -411,19 +669,14 @@ void GfxRenderer::update(
     m_decoder->exec(renderer, res, *f);
     if(m_decoder->formatChanged)
     {
-      // The decoder replaced its textures: rebuild the bindings.
-      for(auto& [e, pass] : m_p)
-        pass.release();
-      m_p.clear();
-      score::gfx::defaultPassesInit(
-          m_p, this->node.output[0]->edges, renderer, renderer.defaultQuad(), m_shaders.first,
-          m_shaders.second, m_processUBO, m_materialUBO, m_decoder->samplers);
+      rebuildPasses(renderer); // the decoder replaced its textures
       m_decoder->formatChanged = false;
     }
     auto& slot = m_frames[m_frameSlot];
     av_frame_free(&slot);
     slot = f;
     m_frameSlot = (m_frameSlot + 1) % 3;
+    m_hasOutput = true;
 
     Material mat;
     mat.tex_w = float(m_format.width);
@@ -435,7 +688,9 @@ void GfxRenderer::update(
 void GfxRenderer::runRenderPass(
     score::gfx::RenderList& renderer, QRhiCommandBuffer& cb, score::gfx::Edge& edge)
 {
-  if(!m_decoder || !m_decoder->hasFrame)
+  if(!m_hasOutput || m_p.empty())
+    return;
+  if(m_transport == Transport::Cpu && (!m_decoder || !m_decoder->hasFrame))
     return;
   score::gfx::quadRenderPass(renderer, m_meshbufs, cb, edge, m_p);
 }
@@ -450,15 +705,17 @@ void GfxRenderer::release(score::gfx::RenderList& r)
   for(auto& [edge, pass] : m_p)
     pass.release();
   m_p.clear();
-  for(auto& in : m_inputs)
-    in.rt.release();
+  m_samplers.clear();
+  m_graph.reset();
+  releaseTransport(r);
   m_inputs.clear();
   for(auto& f : m_frames)
     av_frame_free(&f);
-  av_frame_free(&m_inputFrame);
-  m_graph.reset();
+  av_buffer_unref(&m_hwDevice);
+  m_hwDeviceType = AV_HWDEVICE_TYPE_NONE;
   delete m_materialUBO;
   m_materialUBO = nullptr;
+  m_hasOutput = false;
   defaultRelease(r);
 }
 }

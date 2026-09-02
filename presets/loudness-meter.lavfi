@@ -1,0 +1,2 @@
+# EBU R128 loudness; the measurements arrive on the Metadata outlet (r128.M, r128.S, r128.I, r128.LRA).
+ebur128=metadata=1
