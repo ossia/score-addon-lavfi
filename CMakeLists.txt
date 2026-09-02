@@ -79,22 +79,24 @@ setup_score_plugin(score_addon_lavfi)
 # Headless test of the wrapper: no Qt, no score, no GPU. Not gated on
 # BUILD_TESTING: score's own tests are opt-in per target and this one is tiny,
 # but it must not break an SDK build, where CTest is not set up.
-add_executable(score_addon_lavfi_graph_test tests/GraphTest.cpp ${LAVFI_CORE_SOURCES})
-target_include_directories(score_addon_lavfi_graph_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(score_addon_lavfi_graph_test PRIVATE avfilter avutil)
-target_compile_features(score_addon_lavfi_graph_test PRIVATE cxx_std_20)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/GraphTest.cpp")
+  add_executable(score_addon_lavfi_graph_test tests/GraphTest.cpp ${LAVFI_CORE_SOURCES})
+  target_include_directories(score_addon_lavfi_graph_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_link_libraries(score_addon_lavfi_graph_test PRIVATE avfilter avutil)
+  target_compile_features(score_addon_lavfi_graph_test PRIVATE cxx_std_20)
+endif()
 
 # GPU test of the Vulkan transport on score's shared VkDevice. Needs a Vulkan
 # device and a display; prints SKIP and exits 0 without one. Off by default
 # in SDK/addon CI builds (no GPU there), on where score builds its own testers.
 option(SCORE_LAVFI_GPU_TESTS "Build the lavfi Vulkan transport test" ${SCORE_TESTING})
-if(SCORE_LAVFI_GPU_TESTS AND NOT EMSCRIPTEN)
+if(SCORE_LAVFI_GPU_TESTS AND NOT EMSCRIPTEN AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/VulkanTransportTest.cpp")
   add_executable(score_addon_lavfi_vulkan_test tests/VulkanTransportTest.cpp)
   target_link_libraries(score_addon_lavfi_vulkan_test PRIVATE
     score_addon_lavfi score_plugin_gfx score_plugin_media ${QT_PREFIX}::Gui)
 endif()
 
-if(COMMAND add_test)
+if(COMMAND add_test AND TARGET score_addon_lavfi_graph_test)
   add_test(NAME score_addon_lavfi_graph_test COMMAND score_addon_lavfi_graph_test)
   if(TARGET score_addon_lavfi_vulkan_test)
     add_test(NAME score_addon_lavfi_vulkan_test COMMAND score_addon_lavfi_vulkan_test)

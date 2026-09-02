@@ -29,13 +29,21 @@ namespace Lavfi
 {
 #if defined(LAVFI_VULKAN_TRANSPORT)
 
+static bool lavfiVkDebug()
+{
+  static const bool on = qEnvironmentVariableIsSet("SCORE_LAVFI_DEBUG");
+  return on;
+}
+
 struct VulkanTransport::Impl
 {
+  QRhi* rhi{};
   VkDevice dev{};
   VkQueue queue{};
   uint32_t queueFamily{};
   QVulkanDeviceFunctions* df{};
   PFN_vkQueueSubmit vkQueueSubmit{};
+  int samples{1};
 
   struct Wrapped
   {
@@ -47,32 +55,39 @@ struct VulkanTransport::Impl
   {
     QSize size;
     AVBufferRef* frames{};
-    AVFrame* current{}; ///< acquired for this render frame, not yet handed over
+    AVFrame* current{};  ///< render target of this render frame (not yet submitted)
+    AVFrame* rendered{}; ///< render target of the previous frame (submitted)
     std::map<VkImage, Wrapped> wrapped;
   };
   std::vector<Input> inputs;
 
   // Output ring: the frame being sampled and the previous ones, released two
   // frames later once QRhi's sampling submission is certainly behind us.
+  // `layout` is what QRhi's tracking said about the image when the texture
+  // object moved on to the next frame: that is the state FFmpeg gets back.
+  struct Slot
+  {
+    AVFrame* frame{};
+    VkImageLayout layout{VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  };
   static constexpr int RingSize = 3;
-  AVFrame* ring[RingSize]{};
+  Slot ring[RingSize]{};
   int ringSlot{};
+  int lastSlot{-1};
 
   static AVVkFrame* vkframe(AVFrame* f)
   {
     return f ? reinterpret_cast<AVVkFrame*>(f->data[0]) : nullptr;
   }
-  static AVVulkanFramesContext* framesCtx(AVFrame* f)
-  {
-    if(!f || !f->hw_frames_ctx)
-      return nullptr;
-    auto* fc = reinterpret_cast<AVHWFramesContext*>(f->hw_frames_ctx->data);
-    return static_cast<AVVulkanFramesContext*>(fc->hwctx);
-  }
   static AVHWFramesContext* hwFramesCtx(AVFrame* f)
   {
     return f && f->hw_frames_ctx ? reinterpret_cast<AVHWFramesContext*>(f->hw_frames_ctx->data)
                                  : nullptr;
+  }
+  static AVVulkanFramesContext* framesCtx(AVFrame* f)
+  {
+    auto* fc = hwFramesCtx(f);
+    return fc ? static_cast<AVVulkanFramesContext*>(fc->hwctx) : nullptr;
   }
 
   // An empty submission that only waits on / signals a timeline value.
@@ -119,8 +134,25 @@ struct VulkanTransport::Impl
     return submitTimeline(sem, value, false);
   }
 
-  /// Record what we left the image in and signal the next timeline value.
-  bool releaseFrame(AVFrame* f, VkImageLayout layout, uint32_t access)
+  static uint32_t accessForLayout(VkImageLayout layout)
+  {
+    switch(layout)
+    {
+      case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+        return VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+      case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+        return VK_ACCESS_TRANSFER_WRITE_BIT;
+      case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+        return VK_ACCESS_TRANSFER_READ_BIT;
+      case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+        return VK_ACCESS_SHADER_READ_BIT;
+      default:
+        return VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    }
+  }
+
+  /// Record what QRhi left the image in and signal the next timeline value.
+  bool releaseFrame(AVFrame* f, VkImageLayout layout)
   {
     auto* vkf = vkframe(f);
     auto* fc = hwFramesCtx(f);
@@ -129,7 +161,8 @@ struct VulkanTransport::Impl
       return false;
     vkfc->lock_frame(fc, vkf);
     vkf->layout[0] = layout;
-    vkf->access[0] = static_cast<std::remove_reference_t<decltype(vkf->access[0])>>(access);
+    vkf->access[0]
+        = static_cast<std::remove_reference_t<decltype(vkf->access[0])>>(accessForLayout(layout));
     const VkSemaphore sem = vkf->sem[0];
     const uint64_t value = ++vkf->sem_value[0];
     vkfc->unlock_frame(fc, vkf);
@@ -140,6 +173,11 @@ struct VulkanTransport::Impl
   {
     return sw == AV_PIX_FMT_RGBA || sw == AV_PIX_FMT_BGRA || sw == AV_PIX_FMT_RGB0
            || sw == AV_PIX_FMT_BGR0;
+  }
+  static QRhiTexture::Format textureFormat(AVPixelFormat sw)
+  {
+    return (sw == AV_PIX_FMT_BGRA || sw == AV_PIX_FMT_BGR0) ? QRhiTexture::BGRA8
+                                                            : QRhiTexture::RGBA8;
   }
 };
 
@@ -163,16 +201,19 @@ bool VulkanTransport::available(QRhi& rhi)
          && score::gfx::vkinterop::deviceTimelineSemaphoresEnabled();
 }
 
-bool VulkanTransport::init(const score::gfx::RenderState& state, AVBufferRef* device)
+bool VulkanTransport::init(
+    const score::gfx::RenderState& state, AVBufferRef* device, int samples)
 {
   auto& rhi = *state.rhi;
   if(!available(rhi) || !device)
     return false;
   auto* nh = static_cast<const QRhiVulkanNativeHandles*>(rhi.nativeHandles());
+  m->rhi = &rhi;
   m->dev = nh->dev;
   m->queue = nh->gfxQueue;
   m->queueFamily = nh->gfxQueueFamilyIdx;
   m->df = nh->inst->deviceFunctions(nh->dev);
+  m->samples = samples > 0 ? samples : 1;
   // Device-level entry point through vkGetDeviceProcAddr: the instance-level
   // trampoline crashes on the NVIDIA Windows driver (see HWVulkanShared.hpp).
   if(auto getDevProc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
@@ -199,9 +240,10 @@ int VulkanTransport::addInput(QSize size)
   fc->sw_format = AV_PIX_FMT_RGBA;
   fc->width = size.width();
   fc->height = size.height();
-  // Three in flight: the one score renders into, the one the filter reads,
-  // one spare while the previous returns to the pool.
-  fc->initial_pool_size = 3;
+  // Four in flight: current, rendered, the one the filter reads, one spare
+  // while the previous returns to the pool. The pool grows if a filter keeps
+  // more.
+  fc->initial_pool_size = 4;
   // The full set: FFmpeg >= 7 ORs SAMPLED|STORAGE|TRANSFER_* into whatever is
   // set here, 6.1 takes the field verbatim. COLOR_ATTACHMENT is what lets a
   // QRhi render pass target the image; SAMPLED is what lets a pass sample the
@@ -234,8 +276,6 @@ bool VulkanTransport::acquireInput(const score::gfx::RenderState& state, int inp
   if(input < 0 || input >= int(m->inputs.size()))
     return false;
   auto& in = m->inputs[input];
-  if(in.current)
-    return true; // already acquired for this render frame
 
   AVFrame* f = av_frame_alloc();
   if(av_hwframe_get_buffer(in.frames, f, 0) < 0)
@@ -266,7 +306,7 @@ bool VulkanTransport::acquireInput(const score::gfx::RenderState& state, int inp
       av_frame_free(&f);
       return false;
     }
-    w.rt = score::gfx::createRenderTarget(state, w.texture, 1, false);
+    w.rt = score::gfx::createRenderTarget(state, w.texture, m->samples, false);
     it = in.wrapped.emplace(vkf->img[0], std::move(w)).first;
   }
   else
@@ -275,11 +315,18 @@ bool VulkanTransport::acquireInput(const score::gfx::RenderState& state, int inp
     it->second.texture->setNativeLayout(int(vkf->layout[0]));
   }
   m->waitFrame(f);
+
+  // Rotate. A `rendered` that was never taken (takeInput not called) is
+  // dropped back to the pool.
+  if(in.rendered)
+    av_frame_free(&in.rendered);
+  in.rendered = in.current;
   in.current = f;
-  if(qEnvironmentVariableIsSet("SCORE_LAVFI_DEBUG"))
-    qDebug("lavfi vk: acquire img=%p ffmpeg layout=%d sem=%llu qrhi layout=%d", (void*)vkf->img[0],
-           int(vkf->layout[0]), (unsigned long long)vkf->sem_value[0],
-           int(it->second.texture->nativeTexture().layout));
+  if(lavfiVkDebug())
+    qDebug(
+        "lavfi vk: acquire img=%p ffmpeg layout=%d sem=%llu qrhi layout=%d", (void*)vkf->img[0],
+        int(vkf->layout[0]), (unsigned long long)vkf->sem_value[0],
+        int(it->second.texture->nativeTexture().layout));
   return true;
 }
 
@@ -301,25 +348,28 @@ AVFrame* VulkanTransport::takeInput(int input)
   if(input < 0 || input >= int(m->inputs.size()))
     return nullptr;
   auto& in = m->inputs[input];
-  AVFrame* f = in.current;
+  AVFrame* f = in.rendered;
   if(!f)
     return nullptr;
-  in.current = nullptr;
+  in.rendered = nullptr;
   auto* vkf = Impl::vkframe(f);
   auto it = in.wrapped.find(vkf->img[0]);
   // QRhi tracks the layout it left the attachment in (COLOR_ATTACHMENT_OPTIMAL
-  // after a pass); tell FFmpeg, and signal that our writes are done.
+  // after a pass, TRANSFER_DST after an upload); tell FFmpeg, and signal that
+  // our writes, submitted at the previous endFrame, are done.
   const VkImageLayout layout
       = it != in.wrapped.end() ? VkImageLayout(it->second.texture->nativeTexture().layout)
                                : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-  m->releaseFrame(f, layout, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
-  if(qEnvironmentVariableIsSet("SCORE_LAVFI_DEBUG"))
-    qDebug("lavfi vk: handover img=%p layout=%d sem->%llu", (void*)vkf->img[0], int(layout),
-           (unsigned long long)vkf->sem_value[0]);
+  m->releaseFrame(f, layout);
+  if(lavfiVkDebug())
+    qDebug(
+        "lavfi vk: handover img=%p layout=%d sem->%llu", (void*)vkf->img[0], int(layout),
+        (unsigned long long)vkf->sem_value[0]);
   return f;
 }
 
-QRhiTexture* VulkanTransport::presentOutput(const score::gfx::RenderState& state, AVFrame* frame)
+QRhiTexture* VulkanTransport::presentOutput(
+    const score::gfx::RenderState& state, AVFrame* frame)
 {
   if(!frame)
     return nullptr;
@@ -332,22 +382,31 @@ QRhiTexture* VulkanTransport::presentOutput(const score::gfx::RenderState& state
   }
   auto& rhi = *state.rhi;
   const QSize size{frame->width, frame->height};
-  if(!m_outTexture || m_outTexture->pixelSize() != size)
+  const QRhiTexture::Format fmt = Impl::textureFormat(fc->sw_format);
+
+  // The layout QRhi left the previous frame's image in, before the texture
+  // object moves on: that is what FFmpeg gets back when that slot is released.
+  if(m->lastSlot >= 0 && m_outTexture && m->ring[m->lastSlot].frame)
+    m->ring[m->lastSlot].layout = VkImageLayout(m_outTexture->nativeTexture().layout);
+
+  if(!m_outTexture || m_outTexture->pixelSize() != size || m_outTexture->format() != fmt)
   {
-    delete m_outTexture;
-    m_outTexture = rhi.newTexture(QRhiTexture::RGBA8, size, 1, {});
+    if(m_outTexture)
+      m_outTexture->deleteLater();
+    m_outTexture = rhi.newTexture(fmt, size, 1, {});
     m_outTexture->setName("Lavfi::VulkanTransport::output");
   }
   m_outSwFormat = fc->sw_format;
 
   // Order QRhi's upcoming submission after the filter's, then hand the
-  // image and its layout to QRhi; its own barrier does the SHADER_READ
-  // transition. createFrom bumps the texture generation, which is what makes
-  // the shader resource bindings pick the new image up.
+  // image and its layout to QRhi; its own barrier does the transition.
+  // createFrom bumps the texture generation, which is what makes the shader
+  // resource bindings pick the new image up.
   m->waitFrame(frame);
-  if(qEnvironmentVariableIsSet("SCORE_LAVFI_DEBUG"))
-    qDebug("lavfi vk: present img=%p ffmpeg layout=%d sem=%llu", (void*)vkf->img[0],
-           int(vkf->layout[0]), (unsigned long long)vkf->sem_value[0]);
+  if(lavfiVkDebug())
+    qDebug(
+        "lavfi vk: present img=%p ffmpeg layout=%d sem=%llu", (void*)vkf->img[0],
+        int(vkf->layout[0]), (unsigned long long)vkf->sem_value[0]);
   if(!m_outTexture->createFrom({quint64(vkf->img[0]), int(vkf->layout[0])}))
   {
     av_frame_free(&frame);
@@ -356,35 +415,49 @@ QRhiTexture* VulkanTransport::presentOutput(const score::gfx::RenderState& state
 
   // Ring: release the slot from two frames ago back to the filter's pool,
   // after telling FFmpeg what QRhi did to it.
-  AVFrame*& slot = m->ring[m->ringSlot];
-  if(slot)
+  auto& slot = m->ring[m->ringSlot];
+  if(slot.frame)
   {
-    m->releaseFrame(slot, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT);
-    av_frame_free(&slot);
+    m->releaseFrame(slot.frame, slot.layout);
+    av_frame_free(&slot.frame);
   }
-  slot = frame;
+  slot.frame = frame;
+  slot.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  m->lastSlot = m->ringSlot;
   m->ringSlot = (m->ringSlot + 1) % Impl::RingSize;
   return m_outTexture;
 }
 
 void VulkanTransport::release()
 {
-  // Nothing may still be in flight when the pool images are destroyed.
+  // Nothing may still be in flight when the pool images are destroyed, and
+  // QRhi's deferred destruction of the wrapping views must have run first
+  // (finish() executes the deferred releases): the views reference the
+  // images FFmpeg frees when the frames contexts go.
   if(m->df && m->queue)
     m->df->vkQueueWaitIdle(m->queue);
-  for(auto& f : m->ring)
-    av_frame_free(&f);
+  for(auto& in : m->inputs)
+    for(auto& [img, w] : in.wrapped)
+      w.rt.release(); // deleteLater's the (non-owning) texture too
+  if(m_outTexture)
+  {
+    m_outTexture->deleteLater();
+    m_outTexture = nullptr;
+  }
+  if(m->rhi)
+    m->rhi->finish();
+  for(auto& s : m->ring)
+    av_frame_free(&s.frame);
+  m->lastSlot = -1;
+  m->ringSlot = 0;
   for(auto& in : m->inputs)
   {
     av_frame_free(&in.current);
-    for(auto& [img, w] : in.wrapped)
-      w.rt.release(); // deleteLater's the (non-owning) texture too
+    av_frame_free(&in.rendered);
     in.wrapped.clear();
     av_buffer_unref(&in.frames);
   }
   m->inputs.clear();
-  delete m_outTexture;
-  m_outTexture = nullptr;
   m_outSwFormat = AV_PIX_FMT_NONE;
 }
 
@@ -405,7 +478,7 @@ bool VulkanTransport::available(QRhi&)
 {
   return false;
 }
-bool VulkanTransport::init(const score::gfx::RenderState&, AVBufferRef*)
+bool VulkanTransport::init(const score::gfx::RenderState&, AVBufferRef*, int)
 {
   return false;
 }

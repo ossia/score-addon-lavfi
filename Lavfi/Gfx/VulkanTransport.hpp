@@ -19,13 +19,20 @@
  *   acquire input  : empty submit on the graphics queue WAITING sem >= value,
  *                    so score's render pass starts after FFmpeg's last read.
  *   hand over input: write back layout/access, empty submit SIGNALLING
- *                    value+1 (after endFrame's submit, by queue order), then
- *                    push. FFmpeg waits for that value before reading.
+ *                    value+1, then push. FFmpeg waits for that value before
+ *                    reading. The signal is only valid once the command buffer
+ *                    that rendered into the image has been submitted, which
+ *                    QRhi does at endFrame: so an input goes through two slots,
+ *                    `current` (rendered into during this render frame) and
+ *                    `rendered` (rendered into during the previous one, hence
+ *                    submitted). acquireInput() rotates them; takeInput()
+ *                    hands over `rendered`.
  *   present output : empty submit WAITING sem >= value, so QRhi's next endFrame
  *                    samples after the filter wrote; createFrom + the layout
- *                    FFmpeg left, QRhi adds its own barrier to SHADER_READ.
- *   release output : write back SHADER_READ_ONLY layout, SIGNAL value+1, unref
- *                    (two frames later, after QRhi's sampling submit).
+ *                    FFmpeg left, QRhi adds its own barrier.
+ *   release output : write back the layout QRhi left the image in, SIGNAL
+ *                    value+1, unref (two frames later, after QRhi's sampling
+ *                    submit).
  *
  * Both libavfilter and QRhi submit from the render thread; that is what makes
  * sharing a VkQueue on single-family devices safe.
@@ -59,7 +66,10 @@ public:
   static bool available(QRhi& rhi);
 
   /// @param device from Lavfi::vulkanDeviceForRhi (a reference is taken).
-  bool init(const score::gfx::RenderState& state, AVBufferRef* device);
+  /// @param samples sample count of the render targets (RenderList::samples()).
+  bool init(const score::gfx::RenderState& state, AVBufferRef* device, int samples = 1);
+  /// Waits for the queue, flushes QRhi's deferred releases of the wrapping
+  /// views, then frees the pools. Render thread.
   void release();
   AVBufferRef* device() const noexcept { return m_device; }
 
@@ -67,14 +77,16 @@ public:
   /// Declare one video input of the given size. Returns its index, -1 on failure.
   int addInput(QSize size);
   AVBufferRef* inputFramesContext(int input) const noexcept;
-  /// Take a fresh pool frame for this render frame and make it the current
-  /// render target of @p input. Call once per render frame, before the passes.
+  /// Rotate: the image that was the render target becomes `rendered`, a fresh
+  /// pool image becomes the render target. Once per render frame, after
+  /// takeInput() and before this frame's passes (and once in init).
   bool acquireInput(const score::gfx::RenderState& state, int input);
-  /// The render target for the input's current frame (empty before acquire).
+  /// The render target for the input's current image (empty before acquire).
   score::gfx::TextureRenderTarget renderTargetForInput(int input) const noexcept;
-  /// After QRhi submitted the frame that rendered into the current image:
-  /// record its state for FFmpeg, signal its semaphore, and return the AVFrame
-  /// (owned by the caller: push it, then av_frame_free). nullptr if none.
+  /// The image rendered into during the previous render frame (submitted at
+  /// its endFrame): record its state for FFmpeg, signal its semaphore, and
+  /// return the AVFrame (owned by the caller: push it, then av_frame_free).
+  /// nullptr when there is none yet.
   AVFrame* takeInput(int input);
 
   // ---- output ------------------------------------------------------------
@@ -82,7 +94,8 @@ public:
   /// to sample this render frame. Returns the wrapping texture, nullptr on failure.
   QRhiTexture* presentOutput(const score::gfx::RenderState& state, AVFrame* frame);
   QRhiTexture* outputTexture() const noexcept { return m_outTexture; }
-  /// Pixel format the output texture was wrapped with (RGBA or BGRA order).
+  /// Pixel format of the sink frames (RGBA or BGRA order; the texture is
+  /// created with the matching QRhi format, no swizzle needed).
   AVPixelFormat outputSwFormat() const noexcept { return m_outSwFormat; }
 
 private:

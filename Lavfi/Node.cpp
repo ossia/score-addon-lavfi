@@ -10,8 +10,11 @@
 
 #include <score/tools/Debug.hpp>
 
+#include <ossia/detail/algorithms.hpp>
+
 #include <QDebug>
 
+#include <charconv>
 #include <cstring>
 
 extern "C" {
@@ -102,6 +105,11 @@ void GfxNode::process(int32_t port, const ossia::audio_vector& v)
   if(a < 0)
     return;
   std::lock_guard lock{m_mutex};
+  // Bounded: with no renderer consuming (node not connected to an output, or
+  // a stalled render thread) this would otherwise grow at the sample rate.
+  constexpr std::size_t maxPending = 8;
+  if(m_pendingAudio.size() >= maxPending)
+    m_pendingAudio.erase(m_pendingAudio.begin());
   m_pendingAudio.emplace_back(a, v);
 }
 
@@ -122,7 +130,7 @@ std::vector<std::pair<int, ossia::audio_vector>> GfxNode::takePendingAudio()
 // ---------------------------------------------------------------------------
 
 GfxRenderer::GfxRenderer(const GfxNode& node) noexcept
-    : GenericNodeRenderer{node}
+    : NodeRenderer{node}
 {
 }
 
@@ -185,7 +193,6 @@ bool GfxRenderer::setupTransport(score::gfx::RenderList& renderer, Transport t)
 {
   releaseTransport(renderer);
   auto& rhi = *renderer.state.rhi;
-  auto& n = lavfiNode();
 
   if(t == Transport::Vulkan)
   {
@@ -193,7 +200,7 @@ bool GfxRenderer::setupTransport(score::gfx::RenderList& renderer, Transport t)
     if(!dev)
       return false;
     m_vk = std::make_unique<VulkanTransport>();
-    const bool ok = m_vk->init(renderer.state, dev);
+    const bool ok = m_vk->init(renderer.state, dev, renderer.samples());
     av_buffer_unref(&dev);
     if(!ok)
     {
@@ -203,7 +210,9 @@ bool GfxRenderer::setupTransport(score::gfx::RenderList& renderer, Transport t)
     for(auto& in : m_inputs)
     {
       in.vkInput = m_vk->addInput(in.size);
-      if(in.vkInput < 0)
+      // The first image must be a valid render target before the upstream
+      // node builds its pipeline against it (addOutputPass on our inputs).
+      if(in.vkInput < 0 || !m_vk->acquireInput(renderer.state, in.vkInput))
       {
         m_vk->release();
         m_vk.reset();
@@ -230,7 +239,6 @@ bool GfxRenderer::setupTransport(score::gfx::RenderList& renderer, Transport t)
     m_inputFrame = av_frame_alloc();
     m_transport = Transport::Cpu;
   }
-  (void)n;
   return true;
 }
 
@@ -241,8 +249,12 @@ void GfxRenderer::releaseTransport(score::gfx::RenderList& renderer)
     m_vk->release();
     m_vk.reset();
   }
-  delete m_vkSampler;
-  m_vkSampler = nullptr;
+  if(m_vkSampler)
+  {
+    m_vkSampler->deleteLater();
+    m_vkSampler = nullptr;
+  }
+  m_vkSamplers.clear();
   for(auto& in : m_inputs)
   {
     in.rt.release();
@@ -259,9 +271,10 @@ bool GfxRenderer::buildGraph(score::gfx::RenderList& renderer)
   auto& n = lavfiNode();
   const auto& prog = n.program();
   const bool vulkan = m_transport == Transport::Vulkan;
+  m_rebuildGraph = false;
 
   std::vector<Lavfi::InputConfig> inputs;
-  std::size_t video = 0;
+  std::size_t video = 0, audio = 0;
   for(const auto& pad : prog.desc.inputs)
   {
     Lavfi::InputConfig cfg;
@@ -286,7 +299,9 @@ bool GfxRenderer::buildGraph(score::gfx::RenderList& renderer)
     else
     {
       cfg.audio.sample_rate = prog.sampleRate;
-      cfg.audio.channels = 2;
+      if(audio >= m_audioChannels.size())
+        m_audioChannels.resize(audio + 1, 2);
+      cfg.audio.channels = std::max(1, m_audioChannels[audio++]);
     }
     inputs.push_back(cfg);
   }
@@ -337,6 +352,58 @@ bool GfxRenderer::buildGraph(score::gfx::RenderList& renderer)
   return true;
 }
 
+bool GfxRenderer::currentShaders(
+    const QShader*& vs, const QShader*& fs, std::span<const score::gfx::Sampler>& samplers) const
+{
+  if(m_transport == Transport::Vulkan)
+  {
+    if(!m_vkVertex.isValid() || !m_vkFragment.isValid() || m_vkSamplers.empty())
+      return false;
+    vs = &m_vkVertex;
+    fs = &m_vkFragment;
+    samplers = m_vkSamplers;
+    return true;
+  }
+  if(!m_decoder || !m_shaders.first.isValid() || !m_shaders.second.isValid())
+    return false;
+  vs = &m_shaders.first;
+  fs = &m_shaders.second;
+  samplers = m_decoder->samplers;
+  return true;
+}
+
+void GfxRenderer::addOutputPass(
+    score::gfx::RenderList& renderer, score::gfx::Edge& edge, QRhiResourceUpdateBatch& res)
+{
+  const QShader* vs{};
+  const QShader* fs{};
+  std::span<const score::gfx::Sampler> samplers;
+  if(!currentShaders(vs, fs, samplers))
+    return;
+  auto rt = renderer.renderTargetForOutput(edge);
+  if(!rt.renderTarget)
+    return;
+  auto pip = score::gfx::buildPipeline(
+      renderer, renderer.defaultQuad(), *vs, *fs, rt, m_processUBO, m_materialUBO, samplers);
+  if(pip.pipeline)
+    m_p.emplace_back(&edge, score::gfx::Pass{rt, pip, nullptr});
+}
+
+void GfxRenderer::removeOutputPass(score::gfx::RenderList& renderer, score::gfx::Edge& edge)
+{
+  auto it = ossia::find_if(m_p, [&](const auto& p) { return p.first == &edge; });
+  if(it != m_p.end())
+  {
+    it->second.release();
+    m_p.erase(it);
+  }
+}
+
+bool GfxRenderer::hasOutputPassForEdge(score::gfx::Edge& edge) const
+{
+  return ossia::find_if(m_p, [&](const auto& p) { return p.first == &edge; }) != m_p.end();
+}
+
 void GfxRenderer::rebuildPasses(score::gfx::RenderList& renderer)
 {
   for(auto& [edge, pass] : m_p)
@@ -344,14 +411,11 @@ void GfxRenderer::rebuildPasses(score::gfx::RenderList& renderer)
   m_p.clear();
   if(this->node.output.empty())
     return;
-  if(m_transport == Transport::Vulkan)
-    score::gfx::defaultPassesInit(
-        m_p, this->node.output[0]->edges, renderer, renderer.defaultQuad(), m_vertexS,
-        m_fragmentS, m_processUBO, m_materialUBO, m_samplers);
-  else if(m_decoder)
-    score::gfx::defaultPassesInit(
-        m_p, this->node.output[0]->edges, renderer, renderer.defaultQuad(), m_shaders.first,
-        m_shaders.second, m_processUBO, m_materialUBO, m_decoder->samplers);
+  auto* batch = renderer.state.rhi->nextResourceUpdateBatch();
+  for(auto* edge : this->node.output[0]->edges)
+    addOutputPass(renderer, *edge, *batch);
+  // Nothing was queued on it; hand it back.
+  batch->release();
 }
 
 bool GfxRenderer::setupOutputPass(score::gfx::RenderList& renderer)
@@ -359,7 +423,7 @@ bool GfxRenderer::setupOutputPass(score::gfx::RenderList& renderer)
   // Vulkan transport: a passthrough pass sampling the sink image. The
   // texture object is created by the transport on first present; until then
   // sample the renderer's empty texture so the bindings are complete.
-  QString frag = QString(R"_(#version 450
+  static const QString frag = QString(R"_(#version 450
 
 )_" SCORE_GFX_VIDEO_UNIFORMS R"_(
 
@@ -369,19 +433,16 @@ layout(location = 0) out vec4 fragColor;
 
 void main()
 {
-  fragColor = texture(y_tex, v_texcoord)%1;
+  fragColor = texture(y_tex, v_texcoord);
 }
 )_");
-  const bool bgra = m_vk && (m_vk->outputSwFormat() == AV_PIX_FMT_BGRA
-                             || m_vk->outputSwFormat() == AV_PIX_FMT_BGR0);
-  frag = frag.arg(bgra ? ".bgra" : "");
-  std::tie(m_vertexS, m_fragmentS) = score::gfx::makeShaders(
+  std::tie(m_vkVertex, m_vkFragment) = score::gfx::makeShaders(
       renderer.state, score::gfx::GPUVideoDecoder::vertexShader(), frag);
-  if(!m_vertexS.isValid() || !m_fragmentS.isValid())
+  if(!m_vkVertex.isValid() || !m_vkFragment.isValid())
     return false;
-  m_samplers.clear();
+  m_vkSamplers.clear();
   QRhiTexture* tex = m_vk ? m_vk->outputTexture() : nullptr;
-  m_samplers.push_back({m_vkSampler, tex ? tex : &renderer.emptyTexture()});
+  m_vkSamplers.push_back({m_vkSampler, tex ? tex : &renderer.emptyTexture()});
   rebuildPasses(renderer);
   return true;
 }
@@ -414,17 +475,39 @@ bool GfxRenderer::setupDecoder(score::gfx::RenderList& renderer, AVPixelFormat f
 
 void GfxRenderer::init(score::gfx::RenderList& renderer, QRhiResourceUpdateBatch& res)
 {
+  initState(renderer, res);
+  if(!this->node.output.empty())
+    for(auto* edge : this->node.output[0]->edges)
+      if(!hasOutputPassForEdge(*edge))
+        addOutputPass(renderer, *edge, res);
+}
+
+void GfxRenderer::release(score::gfx::RenderList& r)
+{
+  releaseState(r);
+}
+
+void GfxRenderer::initState(score::gfx::RenderList& renderer, QRhiResourceUpdateBatch& res)
+{
+  if(m_initialized)
+    return;
   auto& rhi = *renderer.state.rhi;
   auto& n = lavfiNode();
 
-  m_meshbufs = renderer.initMeshBuffer(renderer.defaultQuad(), res);
-  processUBOInit(renderer);
+  m_meshBuffer = renderer.initMeshBuffer(renderer.defaultQuad(), res);
+  m_processUBO = rhi.newBuffer(
+      QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, sizeof(score::gfx::ProcessUBO));
+  m_processUBO->setName("Lavfi::GfxRenderer::m_processUBO");
+  m_processUBO->create();
   m_materialUBO = rhi.newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, sizeof(Material));
   m_materialUBO->setName("Lavfi::GfxRenderer::m_materialUBO");
   m_materialUBO->create();
   m_flipY = rhi.isYUpInFramebuffer();
+  m_graphFailed = false;
+  m_lastFrame = -1;
 
-  // Inputs: sizes as resolved for any other 2D input port.
+  // Inputs: sizes as resolved for any other 2D input port. RenderList
+  // re-runs releaseState/initState when a spec changes.
   m_inputs.clear();
   int graphInput = 0;
   for(std::size_t i = 0; i < n.input.size(); i++)
@@ -464,9 +547,8 @@ void GfxRenderer::init(score::gfx::RenderList& renderer, QRhiResourceUpdateBatch
   }
   if(t == Transport::Cpu)
   {
-    if(!setupTransport(renderer, Transport::Cpu))
-      return;
-    buildGraph(renderer);
+    if(setupTransport(renderer, Transport::Cpu))
+      m_graphFailed = !buildGraph(renderer);
   }
   if(m_transport == Transport::Vulkan)
   {
@@ -483,6 +565,41 @@ void GfxRenderer::init(score::gfx::RenderList& renderer, QRhiResourceUpdateBatch
     setupDecoder(
         renderer, m_graph->outputPixelFormat(0), m_graph->outputWidth(0),
         m_graph->outputHeight(0));
+  m_initialized = true;
+}
+
+void GfxRenderer::releaseState(score::gfx::RenderList& r)
+{
+  if(!m_initialized)
+    return;
+  for(auto& [edge, pass] : m_p)
+    pass.release();
+  m_p.clear();
+  if(m_decoder)
+  {
+    m_decoder->release(r);
+    m_decoder.reset();
+  }
+  m_shaders = {};
+  m_vkVertex = {};
+  m_vkFragment = {};
+  // The output ring and the pools go with the transport, which waits for the
+  // queue and flushes QRhi's deferred releases before the images are freed;
+  // the graph (whose pools may back the sink frames) goes after.
+  releaseTransport(r);
+  m_graph.reset();
+  m_inputs.clear();
+  for(auto& f : m_frames)
+    av_frame_free(&f);
+  av_buffer_unref(&m_hwDevice);
+  m_hwDeviceType = AV_HWDEVICE_TYPE_NONE;
+  delete m_materialUBO;
+  m_materialUBO = nullptr;
+  delete m_processUBO;
+  m_processUBO = nullptr;
+  m_meshBuffer = {};
+  m_hasOutput = false;
+  m_initialized = false;
 }
 
 void GfxRenderer::applyControls()
@@ -514,8 +631,15 @@ void GfxRenderer::pushAudio()
       continue;
     const int channels = int(samples.size());
     const int frames = int(samples[0].size());
+    if(a >= int(m_audioChannels.size()))
+      m_audioChannels.resize(a + 1, 2);
     if(channels != m_graph->inputConfig(idx).audio.channels)
-      continue; // layout changed: rebuilt at the next init
+    {
+      // Layout changed: the graph is rebuilt at the end of this update.
+      m_audioChannels[a] = channels;
+      m_rebuildGraph = true;
+      continue;
+    }
     std::vector<std::vector<float>> planes(channels);
     std::vector<const float*> ptrs(channels);
     for(int c = 0; c < channels; c++)
@@ -538,7 +662,10 @@ void GfxRenderer::pushReadbacks(score::gfx::RenderList& renderer)
     const int w = rb.pixelSize.width(), h = rb.pixelSize.height();
     const auto& cfg = m_graph->inputConfig(in.graphInput);
     if(w != cfg.video.width || h != cfg.video.height)
-      continue; // size changed: the graph is rebuilt in update()
+    {
+      rb.data.clear();
+      continue; // a stale readback from before a re-init
+    }
 
     AVFrame* f = m_inputFrame;
     av_frame_unref(f);
@@ -569,8 +696,9 @@ void GfxRenderer::pushReadbacks(score::gfx::RenderList& renderer)
 
 void GfxRenderer::pushVulkanInputs()
 {
-  // Frames acquired for the previous render frame were rendered into and
-  // submitted at its endFrame: hand them over, then acquire this frame's.
+  // The image rendered into during the previous render frame was submitted
+  // at its endFrame: hand it over. The one rendered into during this frame
+  // is handed over next time.
   for(auto& in : m_inputs)
   {
     if(AVFrame* f = m_vk->takeInput(in.vkInput))
@@ -583,29 +711,81 @@ void GfxRenderer::pushVulkanInputs()
   m_frameCounter++;
 }
 
-bool GfxRenderer::inputSizesChanged() const
+void GfxRenderer::publishMetadata()
 {
-  for(auto& in : m_inputs)
+  auto& prog = lavfiNode().program();
+  if(!prog.metadataOut)
+    return;
+  const auto& md = m_graph->lastMetadata(0);
+  if(md.empty())
+    return;
+  auto q = prog.queue.lock();
+  if(!q)
+    return;
+  std::vector<ossia::value> list;
+  list.reserve(md.size());
+  for(const auto& [k, v] : md)
   {
-    if(m_transport == Transport::Cpu && in.rt.texture && in.rt.texture->pixelSize() != in.size)
-      return true;
+    double d{};
+    auto [p, ec] = std::from_chars(v.data(), v.data() + v.size(), d);
+    ossia::value val = (ec == std::errc{} && p == v.data() + v.size()) ? ossia::value{float(d)}
+                                                                          : ossia::value{v};
+    list.push_back(std::vector<ossia::value>{k, std::move(val)});
   }
-  return false;
+  q->enqueue([v = ossia::value{std::move(list)}, port = prog.metadataOut]() mutable {
+    std::swap(port->value, v);
+    port->changed = true;
+  });
+}
+
+void GfxRenderer::drainUnusedOutputs()
+{
+  // Only the first video output is displayed. Anything else the graph
+  // produces (a second video pad, ebur128's default video output, the audio
+  // of an audio+video graph) would otherwise pile up in its sink forever.
+  const int n = m_graph->outputCount();
+  for(int o = 1; o < n; o++)
+  {
+    if(m_graph->outputType(o) == AVMEDIA_TYPE_VIDEO)
+    {
+      while(AVFrame* f = m_graph->pullVideo(o))
+        av_frame_free(&f);
+    }
+    else
+    {
+      const int ch = std::max(1, m_graph->outputChannels(o));
+      m_drainScratch.resize(std::size_t(ch) * 1024);
+      std::vector<float*> planes(ch);
+      for(int c = 0; c < ch; c++)
+        planes[c] = m_drainScratch.data() + std::size_t(c) * 1024;
+      while(m_graph->pullAudio(o, planes.data(), ch, 1024) > 0)
+        ;
+    }
+  }
 }
 
 void GfxRenderer::update(
     score::gfx::RenderList& renderer, QRhiResourceUpdateBatch& res, score::gfx::Edge* edge)
 {
+  if(!m_initialized)
+    return;
+  // Once per render frame, however many edges leave this node.
+  if(m_lastFrame == renderer.frame)
+    return;
+  m_lastFrame = renderer.frame;
+
   auto& n = lavfiNode();
   res.updateDynamicBuffer(m_processUBO, 0, sizeof(score::gfx::ProcessUBO), &n.standardUBO);
 
-  if(!m_graph)
+  if(m_graphFailed || m_transport == Transport::None)
+    return;
+  if(!m_graph || m_rebuildGraph)
   {
-    if(m_transport == Transport::None)
-      return;
-    // Retry a failed configuration (e.g. an input that had no size yet).
     if(!buildGraph(renderer))
+    {
+      m_graphFailed = true;
       return;
+    }
     if(m_transport == Transport::Vulkan)
       setupOutputPass(renderer);
     else
@@ -613,8 +793,6 @@ void GfxRenderer::update(
           renderer, m_graph->outputPixelFormat(0), m_graph->outputWidth(0),
           m_graph->outputHeight(0));
   }
-  if(!m_graph)
-    return;
 
   applyControls();
   pushAudio();
@@ -622,13 +800,14 @@ void GfxRenderer::update(
   if(m_transport == Transport::Vulkan)
   {
     pushVulkanInputs();
-    // Acquire the images this render frame's passes will draw into.
+    // Rotate: this frame's render targets.
     for(auto& in : m_inputs)
       m_vk->acquireInput(renderer.state, in.vkInput);
 
     if(AVFrame* f = m_graph->pullVideo(0))
     {
       QRhiTexture* prev = m_vk->outputTexture();
+      const int w = f->width, h = f->height;
       QRhiTexture* tex = m_vk->presentOutput(renderer.state, f);
       if(!tex)
         return;
@@ -636,16 +815,18 @@ void GfxRenderer::update(
       {
         // First frame, or the texture object was recreated (size change):
         // point the bindings at it. Later frames only bump its generation.
-        m_samplers.clear();
-        m_samplers.push_back({m_vkSampler, tex});
+        m_vkSamplers.clear();
+        m_vkSamplers.push_back({m_vkSampler, tex});
         rebuildPasses(renderer);
       }
       m_hasOutput = true;
       Material mat;
-      mat.tex_w = float(f->width);
-      mat.tex_h = float(f->height);
+      mat.tex_w = float(w);
+      mat.tex_h = float(h);
       res.updateDynamicBuffer(m_materialUBO, 0, sizeof(Material), &mat);
+      publishMetadata();
     }
+    drainUnusedOutputs();
     return;
   }
 
@@ -682,7 +863,9 @@ void GfxRenderer::update(
     mat.tex_w = float(m_format.width);
     mat.tex_h = float(m_format.height);
     res.updateDynamicBuffer(m_materialUBO, 0, sizeof(Material), &mat);
+    publishMetadata();
   }
+  drainUnusedOutputs();
 }
 
 void GfxRenderer::runRenderPass(
@@ -692,30 +875,6 @@ void GfxRenderer::runRenderPass(
     return;
   if(m_transport == Transport::Cpu && (!m_decoder || !m_decoder->hasFrame))
     return;
-  score::gfx::quadRenderPass(renderer, m_meshbufs, cb, edge, m_p);
-}
-
-void GfxRenderer::release(score::gfx::RenderList& r)
-{
-  if(m_decoder)
-  {
-    m_decoder->release(r);
-    m_decoder.reset();
-  }
-  for(auto& [edge, pass] : m_p)
-    pass.release();
-  m_p.clear();
-  m_samplers.clear();
-  m_graph.reset();
-  releaseTransport(r);
-  m_inputs.clear();
-  for(auto& f : m_frames)
-    av_frame_free(&f);
-  av_buffer_unref(&m_hwDevice);
-  m_hwDeviceType = AV_HWDEVICE_TYPE_NONE;
-  delete m_materialUBO;
-  m_materialUBO = nullptr;
-  m_hasOutput = false;
-  defaultRelease(r);
+  score::gfx::quadRenderPass(renderer, m_meshBuffer, cb, edge, m_p);
 }
 }

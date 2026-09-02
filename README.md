@@ -47,7 +47,7 @@ as a gfx node with one of two transports, picked per node at init
   ships 9.0) has no such requirement.
 - **CPU**, everywhere else: the input is read back asynchronously (one frame
   of latency, no GPU stall), filtered, and the result uploaded through score's
-  GPU video decoders (colour conversion on the GPU, any of ~20 pixel formats).
+  GPU video decoders (colour conversion on the GPU, 18 pixel formats).
   The graph still gets a hardware device, so GPU stages inside the string work
   on every backend: `format=rgb0,hwupload_cuda,scale_cuda=...,hwdownload` on
   NVIDIA, `hwupload,scale_d3d11=...,hwdownload` on D3D11, `hwupload,scale_vt=...,
@@ -86,10 +86,10 @@ Lavfi/Library.hpp           .lavfi presets in the library, drag and drop
 Lavfi/Executor.*            picks the execution backend, live reload
 Lavfi/AudioNode.*           ossia node for audio graphs
 Lavfi/Node.*                gfx node + renderer for video graphs, transport ladder
-Lavfi/Gfx/HwDevice.*        FFmpeg device contexts over QRhi (Vulkan, D3D11), CUDA, VideoToolbox
+Lavfi/Gfx/HwDevice.*        FFmpeg device contexts: Vulkan over QRhi (tested), CUDA (tested), D3D11 / VideoToolbox (untested here)
 Lavfi/Gfx/VulkanTransport.* the zero-copy transport
 tests/GraphTest.cpp         headless tests (CPU, Vulkan and CUDA graphs through the wrapper)
-tests/VulkanTransportTest.cpp GPU test: pool image <-> QRhi <-> hflip_vulkan, byte-exact
+tests/VulkanTransportTest.cpp GPU test: pool image <-> QRhi <-> hflip_vulkan, pixel-checked
 ```
 
 Build like any score addon: clone into `score/src/addons/` for an in-tree

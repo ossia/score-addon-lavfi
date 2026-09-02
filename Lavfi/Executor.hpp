@@ -3,6 +3,11 @@
 
 #include <ossia/dataflow/node_process.hpp>
 
+#include <QMetaObject>
+
+#include <string>
+#include <vector>
+
 namespace Lavfi
 {
 class Model;
@@ -15,9 +20,11 @@ class Model;
  *                       the render thread (see Node.hpp for the transports).
  *
  * The port layout of the execution node mirrors the model's inlets/outlets
- * one to one, which is what score's cable wiring relies on. Editing the
- * graph while playing changes the program of the running node when its
- * port layout is unchanged; a layout change takes effect on the next play.
+ * one to one, which is what score's cable wiring relies on. Control inlets
+ * are wired to the node the way the ISF (gfx) and Faust (audio) executors
+ * do it. Editing the graph while playing: same pad/control layout on an
+ * audio graph swaps the program in place; anything else replaces the node
+ * under the running graph (unregister, replace_node, register, nodeChanged).
  */
 class ProcessExecutorComponent final
     : public Execution::ProcessComponent_T<Lavfi::Model, ossia::node_process>
@@ -29,7 +36,12 @@ public:
   ~ProcessExecutorComponent() override;
 
 private:
-  std::size_t m_inletCount{}, m_outletCount{};
+  std::shared_ptr<ossia::graph_node> makeNode();
+  void wireControls(const std::shared_ptr<ossia::graph_node>& node);
+
+  std::string m_signature;
+  std::vector<QMetaObject::Connection> m_controlConnections;
+  int m_generation{};
 };
 
 using ProcessExecutorComponentFactory

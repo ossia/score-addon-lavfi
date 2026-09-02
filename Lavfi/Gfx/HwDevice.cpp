@@ -151,6 +151,20 @@ AVBufferRef* vulkanDeviceForRhi(QRhi& rhi)
     return nullptr;
   }
 
+  // What FFmpeg keeps pointers to (the extension list, the feature chain)
+  // lives as long as the context itself: allocated here, freed by the
+  // context's free callback, one set per device.
+  struct Storage
+  {
+    std::vector<const char*> extensions;
+    VkPhysicalDeviceVulkan11Features f11{};
+    VkPhysicalDeviceVulkan12Features f12{};
+    VkPhysicalDeviceVulkan13Features f13{};
+  };
+  auto* storage = new Storage;
+  devCtx->user_opaque = storage;
+  devCtx->free = [](AVHWDeviceContext* c) { delete static_cast<Storage*>(c->user_opaque); };
+
   // Extensions: what score enabled on the shared device, filtered against
   // what the physical device has. Reporting an unavailable one makes FFmpeg
   // resolve null entry points. The string literals live for the process.
@@ -159,9 +173,7 @@ AVBufferRef* vulkanDeviceForRhi(QRhi& rhi)
   funcs->vkEnumerateDeviceExtensionProperties(nh->physDev, nullptr, &extCount, nullptr);
   std::vector<VkExtensionProperties> exts(extCount);
   funcs->vkEnumerateDeviceExtensionProperties(nh->physDev, nullptr, &extCount, exts.data());
-  static std::vector<const char*> enabled; // FFmpeg keeps the pointer past init
   {
-    std::vector<const char*> list;
     auto wanted = score::gfx::sharedVulkanDeviceExtensions();
     for(auto* ext : extraVulkanExtensions())
       wanted.push_back(ext);
@@ -169,25 +181,21 @@ AVBufferRef* vulkanDeviceForRhi(QRhi& rhi)
       for(auto& e : exts)
         if(std::strcmp(e.extensionName, ext) == 0)
         {
-          list.push_back(ext);
+          storage->extensions.push_back(ext);
           break;
         }
-    enabled = std::move(list);
   }
-  vk->enabled_dev_extensions = enabled.data();
-  vk->nb_enabled_dev_extensions = int(enabled.size());
+  vk->enabled_dev_extensions = storage->extensions.data();
+  vk->nb_enabled_dev_extensions = int(storage->extensions.size());
 
   // Features: the shared device was created with every feature the GPU
   // reports (minus the robustness ones); say so. libplacebo reads this chain.
-  static VkPhysicalDeviceVulkan13Features f13{};
-  static VkPhysicalDeviceVulkan12Features f12{};
-  static VkPhysicalDeviceVulkan11Features f11{};
-  f13 = {};
+  auto& f11 = storage->f11;
+  auto& f12 = storage->f12;
+  auto& f13 = storage->f13;
   f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
-  f12 = {};
   f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
   f12.pNext = &f13;
-  f11 = {};
   f11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
   f11.pNext = &f12;
   vk->device_features = {};

@@ -48,6 +48,10 @@ public:
   /// Log lines of the last (re)build, for diagnostics.
   std::string lastError() const;
 
+  /// Bumped by the executor on every (re)wiring of the controls; queued
+  /// control writes carry the generation they were issued for.
+  int generation{};
+
 private:
   bool rebuild(int sampleRate, const std::vector<int>& inChannels);
   void silence(ossia::exec_state_facade st, int64_t first, int64_t n);
@@ -61,6 +65,7 @@ private:
   int m_rate{};
   std::vector<int> m_inChannels;
   bool m_needsInit{true};
+  bool m_failed{}; ///< the current program does not build: no retry every tick
   int64_t m_pos{};
   std::string m_error;
 

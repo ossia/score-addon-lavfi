@@ -3,6 +3,7 @@
 #include <Process/Dataflow/Port.hpp>
 #include <Process/Dataflow/PortFactory.hpp>
 #include <Process/Dataflow/WidgetInlets.hpp>
+#include <Process/PresetHelpers.hpp>
 
 #include <score/application/ApplicationComponents.hpp>
 #include <score/tools/DeleteAll.hpp>
@@ -69,11 +70,29 @@ void Model::init()
   // (used by the executor to know pad types and options) needs rebuilding.
   std::string err;
   if(!Lavfi::Graph::describe(m_script.toStdString(), m_desc, err))
+  {
+    // This FFmpeg cannot build the document's graph (a filter it lacks).
+    // Keep the ports as saved, so cables survive, and remember what kind of
+    // node they need; the graph itself will fail to configure, visibly.
     m_desc = {};
+    qDebug() << "lavfi: cannot describe the saved graph:" << QString::fromStdString(err);
+  }
   m_controls.clear();
   for(const auto& o : m_desc.options)
     if(o.runtime)
       m_controls.push_back(o);
+  m_portsHaveVideo = false;
+  for(auto* p : m_inlets)
+    if(qobject_cast<Gfx::TextureInlet*>(p))
+      m_portsHaveVideo = true;
+  for(auto* p : m_outlets)
+    if(qobject_cast<Gfx::TextureOutlet*>(p))
+      m_portsHaveVideo = true;
+}
+
+bool Model::hasVideo() const noexcept
+{
+  return m_desc.hasVideo() || (m_desc.inputs.empty() && m_desc.outputs.empty() && m_portsHaveVideo);
 }
 
 QString Model::prettyName() const noexcept
@@ -337,61 +356,25 @@ Process::ScriptChangeResult Model::reload()
   }
   m_inlets = std::move(new_in);
   m_outlets = std::move(new_out);
+  m_portsHaveVideo = m_desc.hasVideo();
 
+  // programChanged is the command's to emit (Scenario::EditScript does, once
+  // the ports and cables are settled), not reload's.
   res.valid = true;
-  programChanged();
   return res;
 }
 
 void Model::loadPreset(const Process::Preset& preset)
 {
-  const rapidjson::Document doc = readJson(preset.data);
-  if(!doc.IsObject())
-    return;
-  auto obj = doc.GetObject();
-  if(auto it = obj.FindMember("Script"); it != obj.MemberEnd() && it->value.IsString())
-  {
-    auto res = setScript(QString::fromUtf8(it->value.GetString()));
-    // Presets are applied from the UI thread on a process that is not being
-    // executed; the ports we dropped can go right away.
-    (void)res;
-    inletsChanged();
-    outletsChanged();
-  }
-  if(auto it = obj.FindMember("Controls"); it != obj.MemberEnd() && it->value.IsArray())
-  {
-    // Control inlets follow the pad inlets, in the order of controlOptions().
-    std::size_t first = m_desc.inputs.size();
-    std::size_t k = 0;
-    for(const auto& v : it->value.GetArray())
-    {
-      if(first + k >= m_inlets.size())
-        break;
-      if(auto ctl = qobject_cast<Process::ControlInlet*>(m_inlets[first + k]))
-        ctl->setValue(JsonValue{v}.to<ossia::value>());
-      k++;
-    }
-  }
+  // The graph string travels in preset.key.effect and is applied through
+  // the script command (cables of dropped ports saved); only the control
+  // values are here. Same as the Faust and JS processes.
+  Process::loadScriptProcessPreset<Model::p_script>(*this, preset);
 }
 
 Process::Preset Model::savePreset() const noexcept
 {
-  Process::Preset p;
-  p.name = this->metadata().getName();
-  p.key.key = this->concreteKey();
-
-  JSONReader r;
-  r.stream.StartObject();
-  r.obj["Script"] = m_script;
-  r.stream.Key("Controls");
-  r.stream.StartArray();
-  for(std::size_t i = m_desc.inputs.size(); i < m_inlets.size(); i++)
-    if(auto ctl = qobject_cast<Process::ControlInlet*>(m_inlets[i]))
-      r.readFrom(ctl->value());
-  r.stream.EndArray();
-  r.stream.EndObject();
-  p.data = r.toByteArray();
-  return p;
+  return Process::saveScriptProcessPreset(*this, m_script);
 }
 }
 

@@ -81,9 +81,8 @@ struct LogRegistry
         if(auto it = self.graphs.find(g); it != self.graphs.end())
         {
           char buf[1024];
-          int print_prefix = 1;
-          av_log_format_line2(avcl, level, fmt, vl, buf, sizeof(buf), &print_prefix);
           Graph& graph = *it->second;
+          av_log_format_line2(avcl, level, fmt, vl, buf, sizeof(buf), &graph.m_logPrefix);
           graph.m_logLine += buf;
           if(!graph.m_logLine.empty() && graph.m_logLine.back() == '\n')
           {
@@ -196,7 +195,10 @@ Graph::~Graph()
 void Graph::destroy()
 {
   for(auto& in : m_inputs)
+  {
     av_frame_free(&in.frame);
+    av_buffer_pool_uninit(&in.pool);
+  }
   for(auto& out : m_outputs)
     av_frame_free(&out.frame);
   m_inputs.clear();
@@ -487,8 +489,11 @@ void Graph::collectDescription()
     std::vector<std::pair<std::string, OptionConst>> consts;
     for(const AVOption* o = av_opt_next(obj, nullptr); o; o = av_opt_next(obj, o))
     {
+      // Constants keep their value in .i64 (libavutil/opt.c), whatever the
+      // type of the option they belong to.
       if(o->type == AV_OPT_TYPE_CONST && o->unit)
-        consts.push_back({o->unit, {o->name, o->default_val.dbl, o->help ? o->help : ""}});
+        consts.push_back(
+            {o->unit, {o->name, double(o->default_val.i64), o->help ? o->help : ""}});
     }
     // Pass 2: the options themselves. Skip aliases: lavfi lists the same
     // storage under several names (e.g. "sigma" and "s"); keep the first.
@@ -511,30 +516,20 @@ void Graph::collectDescription()
       info.min = o->min;
       info.max = o->max;
       info.runtime = (o->flags & AV_OPT_FLAG_RUNTIME_PARAM) != 0;
-      switch(o->type)
+      // The instance's CURRENT value (the graph string's options have been
+      // applied): that is what the control must start from. av_opt_get*
+      // handle every option type, including the ones newer FFmpegs add,
+      // without reading the default_val union by hand.
       {
-        case AV_OPT_TYPE_INT:
-        case AV_OPT_TYPE_INT64:
-        case AV_OPT_TYPE_UINT64:
-        case AV_OPT_TYPE_BOOL:
-        case AV_OPT_TYPE_FLAGS:
-        case AV_OPT_TYPE_DURATION:
-        case AV_OPT_TYPE_PIXEL_FMT:
-        case AV_OPT_TYPE_SAMPLE_FMT:
-          info.def = double(o->default_val.i64);
-          break;
-        case AV_OPT_TYPE_DOUBLE:
-        case AV_OPT_TYPE_FLOAT:
-          info.def = o->default_val.dbl;
-          break;
-        case AV_OPT_TYPE_RATIONAL:
-        case AV_OPT_TYPE_VIDEO_RATE:
-          info.def = o->default_val.q.den ? double(o->default_val.q.num) / o->default_val.q.den : 0.;
-          break;
-        default:
-          if(o->default_val.str)
-            info.def_str = o->default_val.str;
-          break;
+        double d{};
+        if(av_opt_get_double(obj, o->name, 0, &d) >= 0 && std::isfinite(d))
+          info.def = d;
+        uint8_t* str = nullptr;
+        if(av_opt_get(obj, o->name, 0, &str) >= 0 && str)
+        {
+          info.def_str = reinterpret_cast<const char*>(str);
+          av_free(str);
+        }
       }
       if(o->unit)
         for(auto& [unit, c] : consts)
@@ -574,7 +569,33 @@ bool Graph::pushAudio(int i, const float* const* planes, int channels, int frame
   f->nb_samples = frames;
   f->pts = pts;
   av_channel_layout_default(&f->ch_layout, channels);
-  if(av_frame_get_buffer(f, 0) < 0)
+  if(channels <= AV_NUM_DATA_POINTERS)
+  {
+    // Planes from a pool sized for the largest tick seen: after warm-up no
+    // allocation on the audio thread. The pool recycles a plane once the
+    // filters drop their reference to it.
+    if(!in.pool || in.poolFrames < frames)
+    {
+      av_buffer_pool_uninit(&in.pool);
+      in.poolFrames = std::max(frames, std::max(in.poolFrames * 2, 4096));
+      in.pool = av_buffer_pool_init(in.poolFrames * sizeof(float), nullptr);
+      if(!in.pool)
+        return false;
+    }
+    for(int c = 0; c < channels; c++)
+    {
+      f->buf[c] = av_buffer_pool_get(in.pool);
+      if(!f->buf[c])
+      {
+        av_frame_unref(f);
+        return false;
+      }
+      f->data[c] = f->buf[c]->data;
+    }
+    f->linesize[0] = int(frames * sizeof(float));
+    f->extended_data = f->data;
+  }
+  else if(av_frame_get_buffer(f, 0) < 0)
     return false;
   for(int c = 0; c < channels; c++)
     std::memcpy(f->data[c], planes[c], sizeof(float) * frames);

@@ -96,6 +96,10 @@ bool roundTrip(
     rhi.endOffscreenFrame();
   }
 
+  // The frame becomes `rendered` at the next rotation, once its upload has
+  // been submitted (endOffscreenFrame above did that).
+  if(!vk.acquireInput(state, input))
+    return false;
   AVFrame* f = vk.takeInput(input);
   if(!f)
     return false;

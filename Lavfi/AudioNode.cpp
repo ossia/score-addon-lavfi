@@ -14,9 +14,10 @@ std::string commandArgument(const ossia::value& v)
   switch(v.get_type())
   {
     case ossia::val_type::FLOAT: {
+      // std::to_chars: shortest round-trip text, locale independent.
       char buf[64];
-      std::snprintf(buf, sizeof(buf), "%.9g", double(*v.target<float>()));
-      return buf;
+      auto [p, ec] = std::to_chars(buf, buf + sizeof(buf), *v.target<float>());
+      return ec == std::errc{} ? std::string(buf, p) : std::to_string(*v.target<float>());
     }
     case ossia::val_type::INT:
       return std::to_string(*v.target<int>());
@@ -81,6 +82,7 @@ void audio_node::setProgram(
   m_desc = std::move(desc);
   m_controls = std::move(controls);
   m_needsInit = true;
+  m_failed = false;
 }
 
 std::string audio_node::lastError() const
@@ -159,7 +161,7 @@ void audio_node::run(const ossia::token_request& t, ossia::exec_state_facade st)
   const int rate = st.sampleRate();
 
   // --- (re)build when the inputs' shape changed ------------------------------
-  bool needsInit = m_needsInit || rate != m_rate || !m_graph;
+  bool needsInit = m_needsInit || rate != m_rate || (!m_graph && !m_failed);
   std::vector<int>& chans = m_inChannels;
   for(int i = 0; i < m_nAudioIn; i++)
   {
@@ -176,11 +178,14 @@ void audio_node::run(const ossia::token_request& t, ossia::exec_state_facade st)
   if(needsInit)
   {
     m_needsInit = false;
-    if(!rebuild(rate, chans))
-    {
-      silence(st, first_pos, N);
-      return;
-    }
+    m_failed = !rebuild(rate, chans);
+  }
+  if(m_failed || !m_graph)
+  {
+    // A program that does not build stays silent until it changes (or the
+    // inputs change shape); no parse + configure on every tick.
+    silence(st, first_pos, N);
+    return;
   }
 
   // --- runtime options -------------------------------------------------------

@@ -198,7 +198,9 @@ private:
   {
     AVFilterContext* src{};
     InputConfig config;
-    AVFrame* frame{}; ///< Scratch frame for pushAudio.
+    AVFrame* frame{};      ///< Scratch frame for pushAudio.
+    AVBufferPool* pool{};  ///< Sample planes for pushAudio: no malloc per tick.
+    int poolFrames{};      ///< Capacity of each plane, in samples.
   };
   struct Output
   {
@@ -226,6 +228,7 @@ private:
   friend struct LogRegistry;
   std::string m_log;
   std::string m_logLine;
+  int m_logPrefix{1}; ///< av_log_format_line2's persistent print_prefix
 };
 
 /// Human-readable name of an AVOptionType, for the UI.

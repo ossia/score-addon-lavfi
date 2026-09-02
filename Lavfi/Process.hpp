@@ -57,7 +57,9 @@ public:
 
   /// Result of the last successful parse of script().
   const Lavfi::Description& description() const noexcept { return m_desc; }
-  bool hasVideo() const noexcept { return m_desc.hasVideo(); }
+  /// From the description, or from the ports when the graph could not be
+  /// parsed at load time (an FFmpeg without the filters the document uses).
+  bool hasVideo() const noexcept;
 
   /// Options that became control inlets, in inlet order (after the pad inlets).
   const std::vector<Lavfi::OptionInfo>& controlOptions() const noexcept
@@ -87,6 +89,7 @@ private:
   QString m_script;
   Lavfi::Description m_desc;
   std::vector<Lavfi::OptionInfo> m_controls;
+  bool m_portsHaveVideo{};
 };
 
 using ProcessFactory = Process::EffectProcessFactory_T<Lavfi::Model>;

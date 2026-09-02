@@ -43,12 +43,18 @@ public:
     QFile f{path};
     if(!f.open(QIODevice::ReadOnly))
       return {};
+    // One graph per file, possibly over several lines: lines are chained as
+    // filters unless the previous one already ends the chain element.
     QString graph;
     for(const auto& raw : QString::fromUtf8(f.readAll()).split('\n'))
     {
       const QString line = raw.trimmed();
       if(line.isEmpty() || line.startsWith('#'))
         continue;
+      if(!graph.isEmpty() && !graph.endsWith(',') && !graph.endsWith(';')
+         && !graph.endsWith('[') && !line.startsWith(',') && !line.startsWith(';')
+         && !line.startsWith('['))
+        graph += ',';
       graph += line;
     }
     return graph;
