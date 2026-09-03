@@ -237,6 +237,9 @@ private:
   std::vector<Input> m_inputs;
   std::vector<Output> m_outputs;
   bool m_eof{};
+  /// Reported once: a filter emitting non-finite samples is worth saying, but
+  /// not every tick.
+  bool m_reportedNonFinite{};
 
   // av_log capture
   friend struct LogRegistry;

@@ -636,8 +636,14 @@ bool Graph::pushAudio(int i, const float* const* planes, int channels, int frame
       // Planes padded like FFmpeg's own (FFALIGN(nb_samples, 32) plus the
       // input padding): SIMD filters may read up to that.
       in.poolFrames = FFALIGN(std::max(frames, std::max(in.poolFrames * 2, 4096)), 32);
-      in.pool = av_buffer_pool_init(
-          in.poolFrames * sizeof(float) + AV_INPUT_BUFFER_PADDING_SIZE, nullptr);
+      // Zeroed on allocation, not just on hand-out: a filter that reads past
+      // nb_samples (into the alignment libavutil promises is there) would
+      // otherwise read malloc garbage the first time round, which is how
+      // `vibrato` intermittently emitted NaNs. Once recycled, a buffer holds
+      // nothing worse than this graph's own earlier samples.
+      in.pool = av_buffer_pool_init2(
+          in.poolFrames * sizeof(float) + AV_INPUT_BUFFER_PADDING_SIZE, nullptr,
+          [](void*, size_t size) { return av_buffer_allocz(size); }, nullptr);
       if(!in.pool)
         return false;
     }
@@ -656,8 +662,19 @@ bool Graph::pushAudio(int i, const float* const* planes, int channels, int frame
   }
   else if(av_frame_get_buffer(f, 0) < 0)
     return false;
+  // Everything up to the 32-sample alignment, plus the padding, must be
+  // readable AND initialised: that is what libavutil's own audio allocation
+  // guarantees (av_frame_get_buffer zeroes it), and filters do read into it.
+  // The pool hands back recycled memory, so without this the tail is whatever
+  // was there before -- which surfaced as intermittent NaNs out of `vibrato`.
+  const std::size_t tail
+      = (FFALIGN(frames, 32) - frames) * sizeof(float) + AV_INPUT_BUFFER_PADDING_SIZE;
   for(int c = 0; c < channels; c++)
+  {
     std::memcpy(f->data[c], planes[c], sizeof(float) * frames);
+    if(f->buf[c])
+      std::memset(f->data[c] + std::size_t(frames) * sizeof(float), 0, tail);
+  }
   // The source takes the references; f is left allocated but empty.
   return av_buffersrc_add_frame(in.src, f) >= 0;
 }
@@ -684,10 +701,36 @@ int Graph::pullAudio(int o, float* const* planes, int channels, int frames)
     return -1;
   const int n = std::min(f->nb_samples, frames);
   const int ch = std::min(channels, f->ch_layout.nb_channels);
+  // Silenced on the way out, not passed on. A NaN that reaches score's audio
+  // graph spreads through every mixdown it touches and the whole output goes
+  // quiet until the engine restarts; one filter's bug must not cost that.
+  // `vibrato` in FFmpeg 6.1 reads its delay line before writing it and emits
+  // NaNs for the first few milliseconds, intermittently, depending on what
+  // was in the heap.
+  bool nonFinite = false;
   for(int c = 0; c < ch; c++)
-    std::memcpy(planes[c], f->data[c], sizeof(float) * n);
+  {
+    const auto* src = reinterpret_cast<const float*>(f->data[c]);
+    float* dst = planes[c];
+    for(int s = 0; s < n; s++)
+    {
+      const float v = src[s];
+      if(std::isfinite(v)) [[likely]]
+        dst[s] = v;
+      else
+      {
+        dst[s] = 0.f;
+        nonFinite = true;
+      }
+    }
+  }
   for(int c = ch; c < channels; c++)
     std::memset(planes[c], 0, sizeof(float) * n);
+  if(nonFinite && !m_reportedNonFinite)
+  {
+    m_reportedNonFinite = true;
+    m_log += "lavfi: a filter produced non-finite samples; they were silenced\n";
+  }
   collectMetadata(out, *f);
   av_frame_unref(f);
   return n;

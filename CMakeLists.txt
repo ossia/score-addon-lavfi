@@ -90,6 +90,18 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/GraphTest.cpp")
     "LAVFI_PRESET_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/Presets/FFmpeg filter\"")
 endif()
 
+# What the presets DO: each one is fed material chosen for it and the output
+# frames or samples are checked against what the filter is supposed to have
+# done. Same dependencies as the graph test.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/PresetBehaviourTest.cpp")
+  add_executable(score_addon_lavfi_preset_test tests/PresetBehaviourTest.cpp ${LAVFI_CORE_SOURCES})
+  target_include_directories(score_addon_lavfi_preset_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_link_libraries(score_addon_lavfi_preset_test PRIVATE avfilter avutil)
+  target_compile_features(score_addon_lavfi_preset_test PRIVATE cxx_std_20)
+  target_compile_definitions(score_addon_lavfi_preset_test PRIVATE
+    "LAVFI_PRESET_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/Presets/FFmpeg filter\"")
+endif()
+
 # GPU test of the Vulkan transport on score's shared VkDevice. Needs a Vulkan
 # device and a display; prints SKIP and exits 0 without one. Off by default
 # in SDK/addon CI builds (no GPU there), on where score builds its own testers.
@@ -102,6 +114,10 @@ endif()
 
 if(COMMAND add_test AND TARGET score_addon_lavfi_graph_test)
   add_test(NAME score_addon_lavfi_graph_test COMMAND score_addon_lavfi_graph_test)
+  if(TARGET score_addon_lavfi_preset_test)
+    add_test(NAME score_addon_lavfi_preset_test COMMAND score_addon_lavfi_preset_test)
+    set_tests_properties(score_addon_lavfi_preset_test PROPERTIES TIMEOUT 600)
+  endif()
   # The same presets, but through score itself: the process model builds its
   # ports from the graph and the engine runs every one of them. The addons are
   # configured before src/app, so the ossia-score TARGET does not exist yet and
