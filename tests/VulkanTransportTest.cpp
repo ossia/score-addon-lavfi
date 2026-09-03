@@ -265,7 +265,10 @@ std::shared_ptr<RenderState> makeVulkanState(QSize sz)
   }
   state.api = GraphicsApi::Vulkan;
   state.renderSize = sz;
-  state.caps.populate(*state.rhi);
+  // state.caps is deliberately left at its defaults: nothing here reads it
+  // (the transport does not), and RenderState::Caps::populate carries no
+  // export macro, so it is not linkable from outside score's gfx plugin
+  // wherever that plugin is a shared library -- the sanitizer build is.
   state.customDeviceCleanup = [dev, inst] { destroySharedVulkanDevice(inst, dev); };
   std::printf("device: %s, descriptor_buffer=%d timeline=%d\n", "shared-like", int(descriptorBuffer), int(timeline));
   return st;

@@ -38,6 +38,7 @@
  * sharing a VkQueue on single-family devices safe.
  */
 
+#include <Lavfi/Export.hpp>
 #include <Gfx/Graph/RenderState.hpp>
 #include <Gfx/Graph/Utils.hpp>
 
@@ -54,7 +55,7 @@ extern "C" {
 
 namespace Lavfi
 {
-class VulkanTransport
+class SCORE_ADDON_LAVFI_EXPORT VulkanTransport
 {
 public:
   VulkanTransport();

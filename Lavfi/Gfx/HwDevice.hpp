@@ -33,6 +33,7 @@
  * so every lavfi node of a QRhi shares one AVHWDeviceContext.
  */
 
+#include <Lavfi/Export.hpp>
 #include <QtGui/private/qrhi_p.h>
 
 #include <vector>
@@ -46,20 +47,20 @@ namespace Lavfi
 {
 /// New reference to the Vulkan device context of @p rhi, or nullptr when the
 /// backend is not Vulkan or the device is not score's shared one.
-AVBufferRef* vulkanDeviceForRhi(QRhi& rhi);
+SCORE_ADDON_LAVFI_EXPORT AVBufferRef* vulkanDeviceForRhi(QRhi& rhi);
 
 /// New reference to a CUDA device context usable with @p rhi (derived from the
 /// Vulkan device when possible), or nullptr when CUDA is unavailable.
-AVBufferRef* cudaDeviceForRhi(QRhi& rhi);
+SCORE_ADDON_LAVFI_EXPORT AVBufferRef* cudaDeviceForRhi(QRhi& rhi);
 
 /// New reference to the D3D11VA device context over QRhi's ID3D11Device
 /// (Windows, D3D11 backend), else nullptr.
-AVBufferRef* d3d11DeviceForRhi(QRhi& rhi);
+SCORE_ADDON_LAVFI_EXPORT AVBufferRef* d3d11DeviceForRhi(QRhi& rhi);
 
 /// New reference to the best hardware device for filters on this backend:
 /// Vulkan, else D3D11, else VideoToolbox (macOS), else CUDA, else nullptr.
 /// @p type receives the device type of the returned context.
-AVBufferRef* preferredDeviceForRhi(QRhi& rhi, AVHWDeviceType* type = nullptr);
+SCORE_ADDON_LAVFI_EXPORT AVBufferRef* preferredDeviceForRhi(QRhi& rhi, AVHWDeviceType* type = nullptr);
 
 /**
  * @brief The device a given graph needs, or the preferred one.
@@ -70,7 +71,7 @@ AVBufferRef* preferredDeviceForRhi(QRhi& rhi, AVHWDeviceType* type = nullptr);
  * between two hardware formats and refuse the graph. Falls back to
  * preferredDeviceForRhi when the graph says nothing.
  */
-AVBufferRef* deviceForScript(QRhi& rhi, const std::string& script, AVHWDeviceType* type = nullptr);
+SCORE_ADDON_LAVFI_EXPORT AVBufferRef* deviceForScript(QRhi& rhi, const std::string& script, AVHWDeviceType* type = nullptr);
 
 /// Human-readable device type for logs.
 const char* deviceTypeName(AVHWDeviceType t) noexcept;
@@ -80,5 +81,5 @@ const char* deviceTypeName(AVHWDeviceType t) noexcept;
 /// VkDevice itself with those extensions (the GPU test does, to give FFmpeg
 /// 6.1 the VK_EXT_descriptor_buffer it insists on); reporting an extension the
 /// device was not created with makes FFmpeg resolve null entry points.
-void addVulkanDeviceExtensions(std::vector<const char*> extensions);
+SCORE_ADDON_LAVFI_EXPORT void addVulkanDeviceExtensions(std::vector<const char*> extensions);
 }
