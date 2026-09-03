@@ -12,6 +12,7 @@
 #include <Gfx/TexturePort.hpp>
 
 #include <cmath>
+#include <map>
 
 #include <wobjectimpl.h>
 
@@ -22,7 +23,11 @@ namespace Process
 template <>
 QString EffectProcessFactory_T<Lavfi::Model>::customConstructionData() const noexcept
 {
-  return "anull";
+  // Empty on purpose. The library's preset list filters on this string: with
+  // anything in it, selecting the process in the library shows only the
+  // presets whose graph is exactly that, which is one of them at best. The
+  // model turns an empty program into the default graph (see its constructor).
+  return {};
 }
 
 template <>
@@ -231,9 +236,17 @@ Process::Inlet* makeControl(
       return new Process::FloatSpinBox{min, max, def, name, id, parent};
     }
 
+    case AV_OPT_TYPE_COLOR: {
+      float rgba[4]{1.f, 1.f, 1.f, 1.f};
+      Lavfi::parseColor(o.def_str, rgba);
+      return new Process::HSVSlider{
+          ossia::vec4f{rgba[0], rgba[1], rgba[2], rgba[3]}, name, id, parent};
+    }
+
     default:
-      // string, color, duration, rational, video size/rate, pixel format...:
-      // lavfi parses all of them from text.
+      // string, duration, rational, video size/rate, pixel format...: lavfi
+      // parses all of them from text, and an expression ("PI/5", "w/2") is a
+      // string as far as it is concerned.
       return new Process::LineEdit{QString::fromStdString(o.def_str), name, id, parent};
   }
 }
@@ -304,12 +317,21 @@ Process::ScriptChangeResult Model::reload()
     }
   }
 
-  // --- runtime options -> control inlets -----------------------------------------
+  // --- options -> control inlets --------------------------------------------------
+  // Every option, not only the ones libavfilter changes at runtime: the others
+  // are applied when the graph is built, and the executor rebuilds it when one
+  // of them moves. A filter like `vignette`, whose parameters are all
+  // expressions evaluated at init, would otherwise have no controls at all.
+  //
+  // Names are what the user reads, so they are deduplicated here rather than
+  // made unique by construction: two `gblur` in one graph give "gblur sigma"
+  // and "gblur sigma 2".
+  std::map<QString, int> nameCount;
   for(const auto& o : m_desc.options)
   {
-    if(!o.runtime)
-      continue;
-    const QString name = QString::fromStdString(o.portName());
+    QString name = QString::fromStdString(o.displayName());
+    if(const int seen = ++nameCount[name]; seen > 1)
+      name += QStringLiteral(" %1").arg(seen);
     Process::Inlet* kept = nullptr;
     // Keep a control if it has the same name and the same widget kind: the
     // kind is a function of the option type, so a same-named option of the

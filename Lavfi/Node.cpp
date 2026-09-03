@@ -313,7 +313,7 @@ bool GfxRenderer::buildGraph(score::gfx::RenderList& renderer)
 
   auto g = std::make_unique<Lavfi::Graph>();
   std::string err;
-  if(!g->init(prog.script, inputs, sinks, m_hwDevice, err))
+  if(!g->init(prog.script, inputs, sinks, m_hwDevice, err, buildTimeOptions()))
   {
     m_error = err;
     if(lavfiDebug() || !vulkan)
@@ -534,7 +534,9 @@ void GfxRenderer::initState(score::gfx::RenderList& renderer, QRhiResourceUpdate
 
   // Hardware device for the graph's filters, whatever the transport.
   av_buffer_unref(&m_hwDevice);
-  m_hwDevice = preferredDeviceForRhi(rhi, &m_hwDeviceType);
+  // What the graph asks for, not just what the render backend prefers: a
+  // graph full of *_vulkan filters cannot run on a CUDA device.
+  m_hwDevice = deviceForScript(rhi, n.program().script, &m_hwDeviceType);
 
   // Transport ladder: Vulkan when possible and accepted by the graph, else CPU.
   Transport t = chooseTransport(renderer);
@@ -611,13 +613,39 @@ void GfxRenderer::applyControls()
   if(!m_graph)
     return;
   auto& prog = lavfiNode().program();
+  m_optionValues.resize(prog.controls.size());
   for(auto& [k, v] : const_cast<GfxNode&>(lavfiNode()).takePendingControls())
   {
     if(k < 0 || k >= int(prog.controls.size()))
       continue;
     const auto& o = prog.controls[k];
-    m_graph->sendCommand(o.filter, o.name, commandArgument(v));
+    const auto arg = commandArgument(v);
+    if(!worthSending(o, arg) || m_optionValues[k] == arg)
+      continue;
+    if(o.runtime)
+    {
+      m_optionValues[k] = arg;
+      m_graph->sendCommand(o.filter, o.name, arg);
+    }
+    else
+    {
+      // Read once, when the filter is initialised: the graph has to be built
+      // again around the new value. Next update() does it, once, however many
+      // of these moved in the meantime.
+      m_optionValues[k] = arg;
+      m_rebuildGraph = true;
+    }
   }
+}
+
+std::vector<Lavfi::OptionValue> GfxRenderer::buildTimeOptions() const
+{
+  const auto& controls = lavfiNode().program().controls;
+  std::vector<Lavfi::OptionValue> opts;
+  for(std::size_t k = 0; k < controls.size() && k < m_optionValues.size(); k++)
+    if(!controls[k].runtime && !m_optionValues[k].empty())
+      opts.push_back({controls[k].filter, controls[k].name, m_optionValues[k]});
+  return opts;
 }
 
 void GfxRenderer::pushAudio()
@@ -667,8 +695,18 @@ void GfxRenderer::pushReadbacks(score::gfx::RenderList& renderer)
     const auto& cfg = m_graph->inputConfig(in.graphInput);
     if(w != cfg.video.width || h != cfg.video.height)
     {
+      // The upstream picture is not the size this graph was built for. One
+      // frame of that is a readback from before a re-init and is dropped; if
+      // it is the new size, the graph has to be built again around it --
+      // otherwise every later frame is dropped too and the node keeps showing
+      // the last picture it managed to filter.
       rb.data.clear();
-      continue; // a stale readback from before a re-init
+      if(in.size != QSize{w, h})
+      {
+        in.size = QSize{w, h};
+        m_rebuildGraph = true;
+      }
+      continue;
     }
 
     AVFrame* f = m_inputFrame;
@@ -723,17 +761,19 @@ void GfxRenderer::publishMetadata()
   const auto& md = m_graph->lastMetadata(0);
   if(md.empty())
     return;
-  std::vector<ossia::value> list;
-  list.reserve(md.size());
+  // A map, so a receiver addresses a measurement by name (lavfi.r128.M)
+  // instead of counting into a list of pairs.
+  ossia::value_map_type map;
+  map.reserve(md.size());
   for(const auto& [k, v] : md)
   {
     double d{};
     auto [p, ec] = std::from_chars(v.data(), v.data() + v.size(), d);
     ossia::value val = (ec == std::errc{} && p == v.data() + v.size()) ? ossia::value{float(d)}
                                                                           : ossia::value{v};
-    list.push_back(std::vector<ossia::value>{k, std::move(val)});
+    map.emplace_back(k, std::move(val));
   }
-  prog.metadata->post(ossia::value{std::move(list)});
+  prog.metadata->post(ossia::value{std::move(map)});
 }
 
 void GfxRenderer::drainUnusedOutputs()
@@ -763,6 +803,9 @@ void GfxRenderer::update(
 
   if(m_graphFailed || m_transport == Transport::None)
     return;
+  // Before the build: a control that needs a rebuild has to be in hand when
+  // the graph is made, not after.
+  applyControls();
   if(!m_graph || m_rebuildGraph)
   {
     if(!buildGraph(renderer))
@@ -778,7 +821,6 @@ void GfxRenderer::update(
           m_graph->outputHeight(0));
   }
 
-  applyControls();
   pushAudio();
 
   if(m_transport == Transport::Vulkan)

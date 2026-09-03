@@ -365,6 +365,58 @@ std::string brokenHere(const std::string& text)
   return {};
 }
 
+/// Can this machine run a hardware graph of this kind at all? Creating the
+/// device is not enough of an answer: under a sanitizer the CUDA driver
+/// reports out of memory at cuInit and Vulkan refuses to initialise, and a
+/// preset is not broken because the machine cannot run it. Build the smallest
+/// possible upload/download graph and see.
+bool hardwarePathWorks(const std::string& text, AVBufferRef* dev)
+{
+  if(!dev)
+    return false;
+  const bool cuda = text.find("cuda") != std::string::npos;
+  // A filter of the same family, not just the upload: configuring an upload
+  // can succeed on a driver that then cannot load a kernel, which is exactly
+  // what happens under a sanitizer.
+  const char* probe
+      = cuda ? "format=yuv420p,hwupload_cuda,scale_cuda=16:16,hwdownload,format=yuv420p"
+             : "hwupload,hflip_vulkan,hwdownload,format=rgba";
+  Lavfi::Graph g;
+  std::vector<Lavfi::InputConfig> in(1);
+  in[0].type = AVMEDIA_TYPE_VIDEO;
+  in[0].video.width = 32;
+  in[0].video.height = 32;
+  in[0].video.format = AV_PIX_FMT_RGBA;
+  in[0].video.time_base = {1, 48000};
+  in[0].video.frame_rate = {60, 1};
+  Lavfi::SinkConfig sinks;
+  sinks.pix_fmts = {AV_PIX_FMT_RGBA};
+  sinks.threads = 1;
+  std::string err;
+  if(!g.init(probe, in, sinks, dev, err))
+    return false;
+
+  // And it has to survive a frame: initialisation alone touches little.
+  AVFrame* f = av_frame_alloc();
+  f->format = AV_PIX_FMT_RGBA;
+  f->width = 32;
+  f->height = 32;
+  bool ok = false;
+  if(av_frame_get_buffer(f, 0) >= 0)
+  {
+    std::memset(f->data[0], 128, std::size_t(f->linesize[0]) * 32);
+    f->pts = 0;
+    if(g.pushVideo(0, f))
+      if(AVFrame* o = g.pullVideo(0))
+      {
+        ok = o->width > 0;
+        av_frame_free(&o);
+      }
+  }
+  av_frame_free(&f);
+  return ok;
+}
+
 bool needsHardware(const std::string& text)
 {
   return text.find("hwupload") != std::string::npos;
@@ -431,7 +483,13 @@ Result run(const Job& job)
   Lavfi::Graph g;
   if(!g.init(job.text, inputs, sinks, dev, err))
   {
-    res.error = err;
+    if(needsHardware(job.text) && !hardwarePathWorks(job.text, dev))
+    {
+      res.skipped = true;
+      res.error = "the hardware path does not work here";
+    }
+    else
+      res.error = err;
     av_buffer_unref(&dev);
     return res;
   }
@@ -1115,10 +1173,20 @@ std::map<std::string, Case> cases()
            expectVideo(r);
            expectSize(r, VW, VH);
          }};
-  c["360 reprojection (Vulkan).scp"] = {vid(VIn::Pattern), [](const Result& r) {
-                                          expectVideo(r);
-                                          expectDetail(r);
-                                        }};
+  // v360_vulkan arrived in FFmpeg 7; on an older one describe() reports the
+  // filter as missing and the preset is skipped, not failed.
+  c["360 reprojection (Vulkan).scp"]
+      = {vid(VIn::Pattern), [](const Result& r) {
+           expectVideo(r);
+           if(r.video.empty())
+             return;
+           // A 90 degree window on an equirectangular source: the picture is
+           // rebuilt, not passed through, and it is not blank.
+           EXPECT(
+               meanDiff(r.video.back(), inputImage(VIn::Pattern, 0)) > 3,
+               "the reprojection gave back the input untouched");
+           expectDetail(r);
+         }};
 
   // ---- video: generators ---------------------------------------------------
   c["Test pattern.scp"] = {vid(VIn::None, 3), [](const Result& r) {
@@ -1537,7 +1605,8 @@ int main(int argc, char** argv)
   auto specs = cases();
 
   std::vector<std::filesystem::path> files;
-  for(const auto& de : std::filesystem::directory_iterator(dir))
+  // Recursive: the presets are filed by kind.
+  for(const auto& de : std::filesystem::recursive_directory_iterator(dir))
     if(de.path().extension() == ".scp")
       files.push_back(de.path());
   std::sort(files.begin(), files.end());

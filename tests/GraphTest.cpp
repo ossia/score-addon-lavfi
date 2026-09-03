@@ -395,6 +395,58 @@ const std::vector<AVPixelFormat> uploadable_formats{
 
 // The device the renderer hands the graph: Vulkan where score renders with it,
 // and a CUDA device derived from it for the *_cuda filters.
+/// Can this machine run a hardware graph of this kind at all? Creating the
+/// device is not enough of an answer: under a sanitizer the CUDA driver
+/// reports out of memory at cuInit and Vulkan refuses to initialise, and a
+/// preset is not broken because the machine cannot run it. Build the smallest
+/// possible upload/download graph and see.
+bool hardwarePathWorks(const std::string& text, AVBufferRef* dev)
+{
+  if(!dev)
+    return false;
+  const bool cuda = text.find("cuda") != std::string::npos;
+  // A filter of the same family, not just the upload: configuring an upload
+  // can succeed on a driver that then cannot load a kernel, which is exactly
+  // what happens under a sanitizer.
+  const char* probe
+      = cuda ? "format=yuv420p,hwupload_cuda,scale_cuda=16:16,hwdownload,format=yuv420p"
+             : "hwupload,hflip_vulkan,hwdownload,format=rgba";
+  Lavfi::Graph g;
+  std::vector<Lavfi::InputConfig> in(1);
+  in[0].type = AVMEDIA_TYPE_VIDEO;
+  in[0].video.width = 32;
+  in[0].video.height = 32;
+  in[0].video.format = AV_PIX_FMT_RGBA;
+  in[0].video.time_base = {1, 48000};
+  in[0].video.frame_rate = {60, 1};
+  Lavfi::SinkConfig sinks;
+  sinks.pix_fmts = {AV_PIX_FMT_RGBA};
+  sinks.threads = 1;
+  std::string err;
+  if(!g.init(probe, in, sinks, dev, err))
+    return false;
+
+  // And it has to survive a frame: initialisation alone touches little.
+  AVFrame* f = av_frame_alloc();
+  f->format = AV_PIX_FMT_RGBA;
+  f->width = 32;
+  f->height = 32;
+  bool ok = false;
+  if(av_frame_get_buffer(f, 0) >= 0)
+  {
+    std::memset(f->data[0], 128, std::size_t(f->linesize[0]) * 32);
+    f->pts = 0;
+    if(g.pushVideo(0, f))
+      if(AVFrame* o = g.pullVideo(0))
+      {
+        ok = o->width > 0;
+        av_frame_free(&o);
+      }
+  }
+  av_frame_free(&f);
+  return ok;
+}
+
 AVBufferRef* preset_hw_device(const std::string& text)
 {
   const bool cuda = text.find("cuda") != std::string::npos;
@@ -421,7 +473,9 @@ static void test_presets()
 
   int checked = 0, skipped = 0;
   std::vector<fs::path> files;
-  for(const auto& de : fs::directory_iterator(dir))
+  // Recursive: the presets are filed by kind (Video effects, Audio
+  // generators, ...), which is how they appear in score's library.
+  for(const auto& de : fs::recursive_directory_iterator(dir))
     if(de.path().extension() == ".scp")
       files.push_back(de.path());
   std::sort(files.begin(), files.end());
@@ -506,6 +560,13 @@ static void test_presets()
     Lavfi::Graph g;
     if(!g.init(text, in, sinks, dev, err))
     {
+      if(needsHw && !hardwarePathWorks(text, dev))
+      {
+        std::printf("  skip %-28s (the hardware path does not work here)\n", file.c_str());
+        skipped++;
+        av_buffer_unref(&dev);
+        continue;
+      }
       std::fprintf(stderr, "FAIL preset %s: %s\n", file.c_str(), err.c_str());
       failures++;
       av_buffer_unref(&dev);

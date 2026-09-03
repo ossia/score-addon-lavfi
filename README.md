@@ -71,10 +71,11 @@ lavfi graph tests: ok (0 failures); vulkan filters: yes, cuda: yes, libplacebo: 
 
 ## Presets
 
-`Presets/FFmpeg filter/*.scp` are score presets: video and audio effects,
-generators, analysers, and the GPU ones. Copy the `Presets` folder into your
-score user library (the one the Library settings point at) and they appear
-under the process in the library panel.
+`Presets/FFmpeg filter/**.scp` are score presets, filed by kind: video
+effects, video generators, video analysis, audio effects, audio generators,
+audio analysis, audio visualizers. Copy the `Presets` folder into your score
+user library (the one the Library settings point at) and they appear under the
+process in the library panel.
 
 Their graph text is written the way a person writes it, over several lines with
 `#` comments, and that is also what is put in the script editor when the preset
@@ -111,6 +112,25 @@ that only rewrites strides rather than reading pixels, `vflip` being the one
 that bites, will happily accept a hardware frame and leave it untouched, since
 what it flips is a pointer to a `VkImage`. Anything that has to look at the
 pixels makes libavfilter insert the download and upload it needs.
+
+## Ports
+
+The ports are the graph: one per open pad, one per option of every filter in
+it, and a Metadata outlet.
+
+A control whose option libavfilter accepts at runtime is sent as a command as
+you move it. The others are read when a filter is initialised, so moving one
+rebuilds the graph around the new value -- that is what gives `vignette`, whose
+parameters are all expressions evaluated at init, any controls at all.
+
+Ports are named after what they do (`gblur sigma`), not after libavfilter's
+instance names, and a colour option gets a colour control rather than a text
+field. The Metadata outlet carries a map, so a receiver asks for
+`lavfi.r128.M` by name.
+
+An audio visualiser (`showspectrum`, `showvolume`, ...) draws what arrives on
+its audio inlet: with nothing connected it has nothing to draw, and the picture
+is black rather than broken.
 
 ## Layout
 

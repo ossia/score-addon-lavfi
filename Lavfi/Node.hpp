@@ -1,4 +1,5 @@
 #pragma once
+#include <Lavfi/Export.hpp>
 #include <Gfx/GfxExecNode.hpp>
 #include <Gfx/Graph/Node.hpp>
 #include <Gfx/Graph/NodeRenderer.hpp>
@@ -75,7 +76,7 @@ struct MetadataMailbox
  *    Lavfi::preferredDeviceForRhi) so `hwupload,...,hwdownload` stages work on
  *    every backend.
  */
-class GfxNode final : public score::gfx::NodeModel
+class SCORE_ADDON_LAVFI_EXPORT GfxNode final : public score::gfx::NodeModel
 {
 public:
   struct Program
@@ -176,6 +177,8 @@ private:
   void pushVulkanInputs();
   void pushAudio();
   void applyControls();
+  /// The controls libavfilter only reads when it initialises a filter.
+  std::vector<Lavfi::OptionValue> buildTimeOptions() const;
   void publishMetadata();
   void drainUnusedOutputs();
   bool currentShaders(
@@ -192,6 +195,9 @@ private:
   std::vector<Input> m_inputs;
   std::vector<int> m_audioChannels; ///< per audio input; rebuild when a message disagrees
   bool m_rebuildGraph{};
+  /// Last value seen for each control, as libavfilter spells it; indices match
+  /// the program's control list.
+  std::vector<std::string> m_optionValues;
   int64_t m_frameCounter{};
   bool m_flipY{};
   AVBufferRef* m_hwDevice{}; ///< handed to the graph's filters (any transport)

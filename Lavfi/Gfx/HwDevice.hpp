@@ -61,6 +61,17 @@ AVBufferRef* d3d11DeviceForRhi(QRhi& rhi);
 /// @p type receives the device type of the returned context.
 AVBufferRef* preferredDeviceForRhi(QRhi& rhi, AVHWDeviceType* type = nullptr);
 
+/**
+ * @brief The device a given graph needs, or the preferred one.
+ *
+ * A graph naming `*_vulkan` filters or `libplacebo` can only run on a Vulkan
+ * device, and one naming `*_cuda` only on a CUDA device: handing it whatever
+ * the render backend prefers makes libavfilter try to insert a conversion
+ * between two hardware formats and refuse the graph. Falls back to
+ * preferredDeviceForRhi when the graph says nothing.
+ */
+AVBufferRef* deviceForScript(QRhi& rhi, const std::string& script, AVHWDeviceType* type = nullptr);
+
 /// Human-readable device type for logs.
 const char* deviceTypeName(AVHWDeviceType t) noexcept;
 

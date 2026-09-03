@@ -25,9 +25,15 @@ std::string commandArgument(const ossia::value& v)
       return *v.target<bool>() ? "1" : "0";
     case ossia::val_type::STRING:
       return *v.target<std::string>();
+    case ossia::val_type::VEC4F:
+      // The colour controls: score keeps RGBA in 0-1, lavfi wants 0xRRGGBBAA.
+      // Anything else that is four floats reads as a colour too, and there is
+      // no lavfi option taking four numbers that is not one.
+      if(const auto* v4 = v.target<ossia::vec4f>())
+        return Lavfi::formatColor(v4->data());
+      [[fallthrough]];
     case ossia::val_type::VEC2F:
     case ossia::val_type::VEC3F:
-    case ossia::val_type::VEC4F:
     case ossia::val_type::LIST: {
       // "WxH", "num/den" and friends are strings in lavfi; a list becomes the
       // "a|b|c" form most array options accept.
@@ -43,6 +49,20 @@ std::string commandArgument(const ossia::value& v)
     default:
       return ossia::convert<std::string>(v);
   }
+}
+
+/// Is this value worth handing to libavfilter?
+///
+/// Only what changed, and never an empty string: a filter re-reads its whole
+/// configuration when it takes a command, so sending "" for the options that
+/// happen to be empty (curves' `psfile`, its `master` curve) clears the ones
+/// the graph text had set and the filter quietly turns into a pass-through --
+/// and a file option answers an empty name with a read error.
+bool worthSending(const Lavfi::OptionInfo& o, const std::string& arg)
+{
+  if(arg.empty())
+    return false;
+  return true;
 }
 
 audio_node::audio_node(
@@ -115,7 +135,7 @@ bool audio_node::rebuild(int sampleRate, const std::vector<int>& inChannels)
 
   auto g = std::make_unique<Lavfi::Graph>();
   std::string err;
-  if(!g->init(m_script, inputs, sinks, nullptr, err))
+  if(!g->init(m_script, inputs, sinks, nullptr, err, buildTimeOptions()))
   {
     m_error = err;
     m_graph.reset();
@@ -125,9 +145,11 @@ bool audio_node::rebuild(int sampleRate, const std::vector<int>& inChannels)
   m_graph = std::move(g);
 
   // Push the current control values so a graph rebuilt mid-play does not
-  // revert to the option defaults.
+  // revert to the option defaults. The build-time ones are already in.
   for(std::size_t k = 0; k < m_controls.size(); k++)
   {
+    if(!m_controls[k].runtime)
+      continue;
     auto& port = m_inlets[m_nAudioIn + k]->cast<ossia::value_port>();
     auto& data = port.get_data();
     if(!data.empty())
@@ -135,6 +157,19 @@ bool audio_node::rebuild(int sampleRate, const std::vector<int>& inChannels)
           m_controls[k].filter, m_controls[k].name, commandArgument(data.back().value));
   }
   return true;
+}
+
+std::vector<Lavfi::OptionValue> audio_node::buildTimeOptions() const
+{
+  std::vector<Lavfi::OptionValue> opts;
+  for(std::size_t k = 0; k < m_controls.size(); k++)
+  {
+    if(m_controls[k].runtime)
+      continue;
+    if(k < m_optionValues.size() && !m_optionValues[k].empty())
+      opts.push_back({m_controls[k].filter, m_controls[k].name, m_optionValues[k]});
+  }
+  return opts;
 }
 
 void audio_node::silence(ossia::exec_state_facade st, int64_t first, int64_t n)
@@ -188,14 +223,35 @@ void audio_node::run(const ossia::token_request& t, ossia::exec_state_facade st)
     return;
   }
 
-  // --- runtime options -------------------------------------------------------
+  // --- options ---------------------------------------------------------------
+  // Runtime ones go straight in. The others are only read when a filter is
+  // initialised, so a change there means building the graph again: on the next
+  // tick, once, however many of them moved.
+  m_optionValues.resize(m_controls.size());
+  bool rebuildForOptions = false;
   for(std::size_t k = 0; k < m_controls.size(); k++)
   {
     auto& port = m_inlets[m_nAudioIn + k]->cast<ossia::value_port>();
     auto& data = port.get_data();
-    if(!data.empty())
-      m_graph->sendCommand(
-          m_controls[k].filter, m_controls[k].name, commandArgument(data.back().value));
+    if(data.empty())
+      continue;
+    const auto arg = commandArgument(data.back().value);
+    if(!worthSending(m_controls[k], arg) || m_optionValues[k] == arg)
+      continue;
+    m_optionValues[k] = arg;
+    if(m_controls[k].runtime)
+      m_graph->sendCommand(m_controls[k].filter, m_controls[k].name, arg);
+    else
+      rebuildForOptions = true;
+  }
+  if(rebuildForOptions)
+  {
+    m_failed = !rebuild(rate, chans);
+    if(m_failed || !m_graph)
+    {
+      silence(st, first_pos, N);
+      return;
+    }
   }
 
   // --- push this tick's input samples -------------------------------------------
@@ -254,7 +310,9 @@ void audio_node::run(const ossia::token_request& t, ossia::exec_state_facade st)
 
   // --- metadata ----------------------------------------------------------------
   {
-    std::vector<ossia::value> list;
+    // A map: a receiver asks for "lavfi.r128.M" by name rather than counting
+    // into a list of pairs.
+    ossia::value_map_type map;
     for(int o = 0; o < m_nAudioOut; o++)
       for(const auto& [k, v] : m_graph->lastMetadata(o))
       {
@@ -263,10 +321,10 @@ void audio_node::run(const ossia::token_request& t, ossia::exec_state_facade st)
         auto [p, ec] = std::from_chars(v.data(), v.data() + v.size(), d);
         ossia::value val = (ec == std::errc{} && p == v.data() + v.size()) ? ossia::value{float(d)}
                                                                               : ossia::value{v};
-        list.push_back(std::vector<ossia::value>{k, std::move(val)});
+        map.emplace_back(k, std::move(val));
       }
-    if(!list.empty())
-      m_outlets.back()->cast<ossia::value_port>().write_value(std::move(list), 0);
+    if(!map.empty())
+      m_outlets.back()->cast<ossia::value_port>().write_value(std::move(map), 0);
   }
 }
 }

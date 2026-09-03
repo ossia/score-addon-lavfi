@@ -17,6 +17,7 @@ extern "C" {
 #include <libavutil/dict.h>
 #include <libavutil/log.h>
 #include <libavutil/mem.h>
+#include <libavutil/parseutils.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/version.h>
 }
@@ -272,10 +273,48 @@ bool Graph::describe(const std::string& text, Description& out, std::string& err
 
 bool Graph::init(
     const std::string& text, const std::vector<InputConfig>& inputs,
-    const SinkConfig& sinks, AVBufferRef* hw_device, std::string& error)
+    const SinkConfig& sinks, AVBufferRef* hw_device, std::string& error,
+    const std::vector<OptionValue>& options)
 {
   destroy();
+  m_options = options;
   return build(text, &inputs, &sinks, hw_device, true, error);
+}
+
+std::string OptionInfo::displayName() const
+{
+  std::string f = filter;
+  if(f.rfind("Parsed_", 0) == 0)
+    f.erase(0, 7);
+  // ... and the instance number libavfilter appends.
+  if(const auto us = f.rfind('_'); us != std::string::npos && us + 1 < f.size())
+    if(std::all_of(f.begin() + us + 1, f.end(), [](char c) { return std::isdigit(uint8_t(c)); }))
+      f.erase(us);
+  std::string n = name;
+  for(auto* str : {&f, &n})
+    std::replace(str->begin(), str->end(), '_', ' ');
+  return f.empty() ? n : f + " " + n;
+}
+
+bool parseColor(const std::string& text, float rgba[4]) noexcept
+{
+  uint8_t c[4]{};
+  if(text.empty() || av_parse_color(c, text.c_str(), -1, nullptr) < 0)
+    return false;
+  for(int i = 0; i < 4; i++)
+    rgba[i] = float(c[i]) / 255.f;
+  return true;
+}
+
+std::string formatColor(const float rgba[4])
+{
+  const auto q = [](float v) {
+    return int(std::lround(std::clamp(v, 0.f, 1.f) * 255.f));
+  };
+  char buf[16]{};
+  std::snprintf(
+      buf, sizeof(buf), "0x%02X%02X%02X%02X", q(rgba[0]), q(rgba[1]), q(rgba[2]), q(rgba[3]));
+  return buf;
 }
 
 static std::string channelLayoutString(int channels)
@@ -337,6 +376,17 @@ bool Graph::build(
     return fail("could not create filters", ret);
   if((ret = avfilter_graph_segment_apply_opts(seg, 0)) < 0)
     return fail("bad filter options", ret);
+  // Control values for options libavfilter will not change at runtime: they
+  // have to be set here, between the options written in the graph text and
+  // the filters' init.
+  for(const auto& opt : m_options)
+  {
+    AVFilterContext* f = avfilter_graph_get_filter(m_graph, opt.filter.c_str());
+    if(!f)
+      continue;
+    if(av_opt_set(f, opt.name.c_str(), opt.value.c_str(), AV_OPT_SEARCH_CHILDREN) < 0)
+      m_log += "lavfi: " + opt.filter + ": could not set " + opt.name + "=" + opt.value + "\n";
+  }
   if(hw_device)
   {
     for(unsigned i = 0; i < m_graph->nb_filters; i++)

@@ -54,11 +54,17 @@ public:
 
 private:
   bool rebuild(int sampleRate, const std::vector<int>& inChannels);
+  /// The controls libavfilter only reads when it initialises a filter.
+  std::vector<Lavfi::OptionValue> buildTimeOptions() const;
   void silence(ossia::exec_state_facade st, int64_t first, int64_t n);
 
   std::string m_script;
   Lavfi::Description m_desc;
   std::vector<Lavfi::OptionInfo> m_controls;
+  /// Last value seen for each control, as libavfilter spells it. Only the
+  /// non-runtime ones are read back (buildTimeOptions), but the indices match
+  /// m_controls so there is nothing to map.
+  std::vector<std::string> m_optionValues;
   std::unique_ptr<Lavfi::Graph> m_graph;
 
   int m_nAudioIn{}, m_nAudioOut{};
@@ -77,4 +83,6 @@ private:
 
 /// The textual form avfilter_process_command wants for a control's value.
 std::string commandArgument(const ossia::value& v);
+/// Whether a control value should be handed to libavfilter at all.
+bool worthSending(const Lavfi::OptionInfo& o, const std::string& arg);
 }

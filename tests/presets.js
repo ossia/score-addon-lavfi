@@ -38,8 +38,12 @@ if(!dir)
   Qt.exit(1);
 }
 
-// listFiles returns absolute paths.
-const files = Util.listFiles(dir, "*.scp").sort();
+// listFiles returns absolute paths and does not recurse; the presets are
+// filed by kind (Video effects, Audio generators, ...).
+let files = Util.listFiles(dir, "*.scp");
+for(const sub of Util.listDirectories(dir))
+  files = files.concat(Util.listFiles(sub, "*.scp"));
+files.sort();
 if(files.length === 0)
 {
   console.error("presets: no .scp files in " + dir);

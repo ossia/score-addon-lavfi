@@ -1,5 +1,7 @@
 #include "HwDevice.hpp"
 
+#include <Lavfi/Core/Graph.hpp>
+
 #include <Video/GpuFormats.hpp>
 
 #include <QDebug>
@@ -396,5 +398,83 @@ AVBufferRef* preferredDeviceForRhi(QRhi& rhi, AVHWDeviceType* type)
     return cuda;
   }
   return nullptr;
+}
+
+/// Can a Vulkan filter actually run on this device? Asking the device is not
+/// enough: what FFmpeg needs from it (VK_EXT_descriptor_buffer, up to 7.0)
+/// only shows when a filter configures. One answer per device, kept.
+bool vulkanDeviceRunsFilters(AVBufferRef* dev)
+{
+  if(!dev || !hasFilter("hflip_vulkan"))
+    return false;
+
+  static std::mutex mutex;
+  static std::vector<std::pair<const AVBufferRef*, bool>> known;
+  std::lock_guard lock{mutex};
+  for(const auto& [d, ok] : known)
+    if(d == dev)
+      return ok;
+
+  Lavfi::Graph g;
+  std::vector<Lavfi::InputConfig> in(1);
+  in[0].type = AVMEDIA_TYPE_VIDEO;
+  in[0].video.width = 32;
+  in[0].video.height = 32;
+  in[0].video.format = AV_PIX_FMT_RGBA;
+  in[0].video.time_base = {1, 1000000};
+  in[0].video.frame_rate = {60, 1};
+  Lavfi::SinkConfig sinks;
+  sinks.pix_fmts = {AV_PIX_FMT_RGBA};
+  sinks.threads = 1;
+  std::string err;
+  const bool ok = g.init("hwupload,hflip_vulkan,hwdownload,format=rgba", in, sinks, dev, err);
+  if(!ok && qEnvironmentVariableIsSet("SCORE_LAVFI_DEBUG"))
+    qDebug() << "lavfi: score's Vulkan device cannot run the filters:"
+             << QString::fromStdString(err);
+  known.emplace_back(dev, ok);
+  return ok;
+}
+
+AVBufferRef* deviceForScript(QRhi& rhi, const std::string& script, AVHWDeviceType* type)
+{
+  const auto mentions = [&](std::string_view what) {
+    return script.find(what) != std::string::npos;
+  };
+
+  if(mentions("_cuda"))
+  {
+    if(auto cuda = cudaDeviceForRhi(rhi))
+    {
+      if(type)
+        *type = AV_HWDEVICE_TYPE_CUDA;
+      return cuda;
+    }
+  }
+  else if(mentions("_vulkan") || mentions("libplacebo"))
+  {
+    if(auto vk = vulkanDeviceForRhi(rhi); vk && vulkanDeviceRunsFilters(vk))
+    {
+      if(type)
+        *type = AV_HWDEVICE_TYPE_VULKAN;
+      return vk;
+    }
+    else if(vk)
+    {
+      av_buffer_unref(&vk);
+    }
+    // Either score is not rendering with Vulkan, or the device it renders
+    // with cannot run the filters (FFmpeg 6.1's need VK_EXT_descriptor_buffer,
+    // which score's shared device does not enable). A device of our own runs
+    // them, at the cost of the copies this graph's own hwupload does anyway --
+    // without it the node has nothing to show at all.
+    AVBufferRef* own{};
+    if(av_hwdevice_ctx_create(&own, AV_HWDEVICE_TYPE_VULKAN, nullptr, nullptr, 0) >= 0)
+    {
+      if(type)
+        *type = AV_HWDEVICE_TYPE_VULKAN;
+      return own;
+    }
+  }
+  return preferredDeviceForRhi(rhi, type);
 }
 }

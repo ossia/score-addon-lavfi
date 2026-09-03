@@ -45,7 +45,7 @@ struct Rendered
 /// source shader -> lavfi graph -> offscreen sink, `frames` frames of it.
 Rendered render(
     score::gfx::GraphicsApi api, const char* sourceShader, const std::string& script,
-    int frames = 4)
+    int frames = 16, QSize size = {64, 64})
 {
   Rendered out;
   score::test::run_in_gui_app([&](const score::GUIApplicationContext&) {
@@ -63,7 +63,7 @@ Rendered render(
     }
     prog.metadata = std::make_shared<Lavfi::MetadataMailbox>();
     const int node = p.addNode(std::make_unique<Lavfi::GfxNode>(std::move(prog)));
-    const int sink = p.addSink({64, 64});
+    const int sink = p.addSink(size);
     if(node < 0 || src < 0 || sink < 0)
     {
       out.error = "the pipeline could not be built";
@@ -235,6 +235,203 @@ TEST_CASE("a lavfi node turns the picture upside down", "[lavfi][gfx]")
     INFO("row " << y);
     CHECK(std::abs(chan(flipped.img, x, y, 1) - chan(plain.img, x, h - 1 - y, 1)) <= 8);
   }
+}
+
+// A graph whose last filter emits planar YUV with an alpha plane: the frame
+// that reaches the uploader then has four planes at two different sizes, which
+// is where a decoder picking one size for all of them shows up as the picture
+// in a corner with a scaled copy over it.
+TEST_CASE("a lavfi node shows a planar YUV frame with alpha", "[lavfi][gfx]")
+{
+  const auto api = GENERATE(from_range(score::test::gfx::platform_backends()));
+  CAPTURE(score::test::gfx::backend_name(api));
+
+  const Rendered r = render(api, "isf-gradient-x.fs", "format=yuva420p");
+  if(r.skipped)
+    SKIP(r.backend + ": " + r.skipReason);
+  REQUIRE(r.error.empty());
+  REQUIRE(r.img.valid());
+  CAPTURE(r.backend);
+
+  const Rendered plain = render(api, "isf-gradient-x.fs", "null");
+  REQUIRE(plain.img.valid());
+  const int y = r.img.height / 2;
+  for(int x : {2, r.img.width / 4, r.img.width / 2, r.img.width - 3})
+  {
+    INFO("column " << x);
+    // 8-bit limited-range YUV with subsampled chroma: a gradient comes back
+    // within a step or two, not as a different picture.
+    CHECK(std::abs(chan(r.img, x, y, 0) - chan(plain.img, x, y, 0)) <= 20);
+  }
+}
+
+// A GPU filter written the portable way, with the upload and download in the
+// graph. On the Vulkan transport the node is already handing the graph
+// hardware frames, so this has to keep working rather than come out black.
+TEST_CASE("a lavfi node runs a graph that uploads for itself", "[lavfi][gfx]")
+{
+  const auto api = GENERATE(from_range(score::test::gfx::platform_backends()));
+  CAPTURE(score::test::gfx::backend_name(api));
+
+  const Rendered r
+      = render(api, "isf-gradient-x.fs", "hwupload,hflip_vulkan,hwdownload,format=rgba");
+  if(r.skipped)
+    SKIP(r.backend + ": " + r.skipReason);
+  if(!r.error.empty())
+    SKIP(r.backend + ": " + r.error); // no Vulkan filters in this FFmpeg
+  REQUIRE(r.img.valid());
+  CAPTURE(r.backend);
+
+  const Rendered plain = render(api, "isf-gradient-x.fs", "null");
+  REQUIRE(plain.img.valid());
+  const int y = r.img.height / 2;
+  const int w = r.img.width;
+  REQUIRE(std::abs(chan(plain.img, w - 3, y, 0) - chan(plain.img, 2, y, 0)) > 100);
+  for(int x : {2, w / 4, w / 2, w - 3})
+  {
+    INFO("column " << x);
+    CHECK(std::abs(chan(r.img, x, y, 0) - chan(plain.img, w - 1 - x, y, 0)) <= 10);
+  }
+}
+
+// A frame that comes back from CUDA: hwdownload hands over a plane whose
+// stride is padded to the driver's pitch, which is where a picture drawn as if
+// stride were width ends up in a corner, repeated.
+TEST_CASE("a lavfi node shows a frame downloaded from CUDA", "[lavfi][gfx]")
+{
+  const auto api = GENERATE(from_range(score::test::gfx::platform_backends()));
+  CAPTURE(score::test::gfx::backend_name(api));
+
+  const Rendered r = render(
+      api, "isf-gradient-x.fs",
+      "format=yuv420p,hwupload_cuda,scale_cuda=64:64,hwdownload,format=yuv420p");
+  if(r.skipped)
+    SKIP(r.backend + ": " + r.skipReason);
+  if(!r.error.empty())
+    SKIP(r.backend + ": " + r.error); // no CUDA here
+  REQUIRE(r.img.valid());
+  CAPTURE(r.backend);
+
+  const Rendered plain = render(api, "isf-gradient-x.fs", "null");
+  REQUIRE(plain.img.valid());
+  const int y = r.img.height / 2;
+  for(int x : {2, r.img.width / 4, r.img.width / 2, r.img.width - 3})
+  {
+    INFO("column " << x);
+    CHECK(std::abs(chan(r.img, x, y, 0) - chan(plain.img, x, y, 0)) <= 20);
+  }
+}
+
+// The shipped CUDA chroma key, at a size whose stride the driver pads: the
+// keyer also adds an alpha plane, so what comes back down is four planes at
+// two sizes with a stride wider than the picture.
+TEST_CASE("the CUDA chroma key preset shows what it keyed", "[lavfi][gfx]")
+{
+  const auto api = GENERATE(from_range(score::test::gfx::platform_backends()));
+  CAPTURE(score::test::gfx::backend_name(api));
+
+  const char* graph = "format=yuv420p,hwupload_cuda,"
+                      "chromakey_cuda=color=0x00FF00:similarity=0.3:blend=0.1,"
+                      "hwdownload,format=yuva420p";
+  const QSize size{300, 200}; // not a multiple of any plausible pitch
+  const Rendered r = render(api, "isf-gradient-x.fs", graph, 16, size);
+  if(r.skipped)
+    SKIP(r.backend + ": " + r.skipReason);
+  if(!r.error.empty())
+    SKIP(r.backend + ": " + r.error); // no CUDA here
+  REQUIRE(r.img.valid());
+  CAPTURE(r.backend);
+
+  const Rendered plain = render(api, "isf-gradient-x.fs", "null", 16, size);
+  REQUIRE(plain.img.valid());
+  REQUIRE(r.img.width == plain.img.width);
+  const int y = r.img.height / 2;
+  for(int x : {2, r.img.width / 4, r.img.width / 2, r.img.width - 3})
+  {
+    INFO("column " << x);
+    // The gradient has no green in it, so the keyer leaves the picture alone.
+    CHECK(std::abs(chan(r.img, x, y, 0) - chan(plain.img, x, y, 0)) <= 20);
+  }
+}
+
+// An audio visualiser: audio in, picture out, no video input at all. The
+// samples arrive the way score's engine delivers them, one buffer per frame
+// on the node's Audio port.
+TEST_CASE("a lavfi node draws the audio it is given", "[lavfi][gfx]")
+{
+  const auto api = GENERATE(from_range(score::test::gfx::platform_backends()));
+  CAPTURE(score::test::gfx::backend_name(api));
+
+  Rendered out;
+  score::test::run_in_gui_app([&](const score::GUIApplicationContext&) {
+    score::test::gfx::GfxPipeline p;
+
+    Lavfi::GfxNode::Program prog;
+    prog.script = "showvolume=w=320:h=60:rate=60";
+    std::string err;
+    if(!Lavfi::Graph::describe(prog.script, prog.desc, err))
+    {
+      out.error = "describe: " + err;
+      return;
+    }
+    prog.metadata = std::make_shared<Lavfi::MetadataMailbox>();
+    const int node = p.addNode(std::make_unique<Lavfi::GfxNode>(std::move(prog)));
+    const int sink = p.addSink({320, 60});
+    if(node < 0 || sink < 0)
+    {
+      out.error = "the pipeline could not be built";
+      return;
+    }
+    p.wire(p.nodeImageOut(node), p.sinkInput(sink));
+    if(!p.create(api))
+    {
+      out.skipped = p.skipped();
+      out.skipReason = p.skipReason();
+      out.error = p.error();
+      out.backend = p.backend();
+      return;
+    }
+
+    // The Audio port is the graph's one audio pad: the node has no other input.
+    int audioPort = -1;
+    for(std::size_t i = 0; i < p.node(node)->input.size(); i++)
+      if(p.node(node)->input[i]->type == score::gfx::Types::Audio)
+      {
+        audioPort = int(i);
+        break;
+      }
+    if(audioPort < 0)
+    {
+      out.error = "the node has no audio input";
+      return;
+    }
+
+    for(int f = 0; f < 40; f++)
+    {
+      // The entry point the engine uses to deliver a buffer to a node.
+      static_cast<score::gfx::ProcessNode*>(p.node(node))
+          ->process(int32_t(audioPort), score::test::gfx::const_audio(0.7, 512));
+      p.render(1);
+    }
+    out.backend = p.backend();
+    out.error = p.error();
+    out.img = p.readback(sink);
+  });
+
+  if(out.skipped)
+    SKIP(out.backend + ": " + out.skipReason);
+  REQUIRE(out.error.empty());
+  REQUIRE(out.img.valid());
+  CAPTURE(out.backend);
+
+  // A full-scale signal draws a long bar: plenty of lit pixels.
+  int lit = 0;
+  for(int y = 0; y < out.img.height; y++)
+    for(int x = 0; x < out.img.width; x++)
+      if(out.img.at(x, y)[0] + out.img.at(x, y)[1] + out.img.at(x, y)[2] > 120)
+        lit++;
+  CAPTURE(lit);
+  CHECK(lit > 200);
 }
 
 // A graph the node cannot configure must leave the picture alone rather than

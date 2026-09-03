@@ -28,6 +28,8 @@
  * realtime-safe; swapping a built one in is.
  */
 
+#include <Lavfi/Export.hpp>
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -75,11 +77,23 @@ struct OptionInfo
   bool runtime{};      ///< AV_OPT_FLAG_RUNTIME_PARAM: changeable through sendCommand.
   std::vector<OptionConst> consts; ///< Named values when the option has a unit.
 
-  /// "filter/name", the score port name.
+  /// "filter/name": how the option is addressed in a command. Not shown.
   std::string portName() const { return filter + "/" + name; }
+
+  /// What the port is called in score: "gblur sigma". libavfilter's instance
+  /// names ("Parsed_gblur_0") and its underscores are not for reading, and a
+  /// '/' in a port name reads as a path separator everywhere in score.
+  std::string displayName() const;
 };
 
-struct Description
+/// An option set on a filter before the graph is initialised, for the options
+/// libavfilter will not take at runtime: the graph is rebuilt around them.
+struct OptionValue
+{
+  std::string filter, name, value;
+};
+
+struct SCORE_ADDON_LAVFI_EXPORT Description
 {
   std::vector<PadInfo> inputs;
   std::vector<PadInfo> outputs;
@@ -123,7 +137,7 @@ struct SinkConfig
   int threads{1};
 };
 
-class Graph
+class SCORE_ADDON_LAVFI_EXPORT Graph
 {
 public:
   Graph();
@@ -152,9 +166,12 @@ public:
    * @param inputs one entry per open input pad, in the order describe() lists them.
    * @param hw_device optional AVHWDeviceContext ref; ref'd onto every filter.
    */
+  /// @param options values applied to the filters before they are initialised
+  ///        (what sendCommand cannot do afterwards).
   bool init(
       const std::string& text, const std::vector<InputConfig>& inputs,
-      const SinkConfig& sinks, AVBufferRef* hw_device, std::string& error);
+      const SinkConfig& sinks, AVBufferRef* hw_device, std::string& error,
+      const std::vector<OptionValue>& options = {});
 
   bool valid() const noexcept { return m_graph != nullptr; }
   const Description& description() const noexcept { return m_desc; }
@@ -237,6 +254,8 @@ private:
   std::vector<Input> m_inputs;
   std::vector<Output> m_outputs;
   bool m_eof{};
+  /// Option values applied at build time; see OptionValue.
+  std::vector<OptionValue> m_options;
   /// Reported once: a filter emitting non-finite samples is worth saying, but
   /// not every tick.
   bool m_reportedNonFinite{};
@@ -253,6 +272,13 @@ const char* optionTypeName(AVOptionType t) noexcept;
 
 /// True when libavfilter has @p name (e.g. "gblur_vulkan"): the process uses
 /// it to report which GPU filter families the running FFmpeg was built with.
-bool hasFilter(const char* name) noexcept;
+SCORE_ADDON_LAVFI_EXPORT bool hasFilter(const char* name) noexcept;
+
+/// Parse what libavfilter accepts as a colour ("red", "#ff8000", "0xRRGGBBAA")
+/// into the 0-1 RGBA score's colour control uses. False if it is not a colour.
+SCORE_ADDON_LAVFI_EXPORT bool parseColor(const std::string& text, float rgba[4]) noexcept;
+
+/// The inverse: what to hand back to libavfilter for that colour.
+SCORE_ADDON_LAVFI_EXPORT std::string formatColor(const float rgba[4]);
 
 } // namespace Lavfi
