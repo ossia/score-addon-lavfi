@@ -84,6 +84,10 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/GraphTest.cpp")
   target_include_directories(score_addon_lavfi_graph_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
   target_link_libraries(score_addon_lavfi_graph_test PRIVATE avfilter avutil)
   target_compile_features(score_addon_lavfi_graph_test PRIVATE cxx_std_20)
+  # It also runs every shipped preset. A preset whose filters this FFmpeg was
+  # not built with is skipped, not failed.
+  target_compile_definitions(score_addon_lavfi_graph_test PRIVATE
+    "LAVFI_PRESET_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/Presets/FFmpeg filter\"")
 endif()
 
 # GPU test of the Vulkan transport on score's shared VkDevice. Needs a Vulkan
@@ -98,6 +102,18 @@ endif()
 
 if(COMMAND add_test AND TARGET score_addon_lavfi_graph_test)
   add_test(NAME score_addon_lavfi_graph_test COMMAND score_addon_lavfi_graph_test)
+  # The same presets, but through score itself: the process model builds its
+  # ports from the graph and the engine runs every one of them. The addons are
+  # configured before src/app, so the ossia-score TARGET does not exist yet and
+  # cannot be tested for here; the runner reports ctest's skip code (77) when
+  # the binary is not there, which is also what happens in an SDK build.
+  if(UNIX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/run-presets.sh")
+    add_test(NAME score_addon_lavfi_presets
+             COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/run-presets.sh"
+                     "${CMAKE_BINARY_DIR}/ossia-score")
+    set_tests_properties(score_addon_lavfi_presets PROPERTIES
+      LABELS "gui" TIMEOUT 400 SKIP_RETURN_CODE 77)
+  endif()
   if(TARGET score_addon_lavfi_vulkan_test)
     add_test(NAME score_addon_lavfi_vulkan_test COMMAND score_addon_lavfi_vulkan_test)
     set_tests_properties(score_addon_lavfi_vulkan_test PROPERTIES

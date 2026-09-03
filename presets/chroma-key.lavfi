@@ -1,2 +1,0 @@
-# Green-screen key: colour, similarity and blend are runtime controls.
-chromakey=color=0x00FF00:similarity=0.3:blend=0.1

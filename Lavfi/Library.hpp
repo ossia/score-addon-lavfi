@@ -9,6 +9,7 @@
 
 #include <QFile>
 
+#include <Lavfi/Core/Graph.hpp>
 #include <Lavfi/Process.hpp>
 
 namespace Lavfi
@@ -16,10 +17,13 @@ namespace Lavfi
 /**
  * @brief `.lavfi` files in the user library become presets of the process.
  *
- * A .lavfi file is a filtergraph string (comments with '#' at line start are
- * stripped, lines are joined). The repository ships a `presets/` folder to
- * copy into the library; the process is created with the file's content as
- * its program, so the preset does not depend on the file afterwards.
+ * A .lavfi file is a filtergraph string: whole-line '#' comments are stripped
+ * and the remaining lines are joined (Lavfi::Graph::preprocess). The process
+ * is created with the file's content as its program, so the entry does not
+ * depend on the file afterwards.
+ *
+ * This is for graphs a user drops in their library. The presets the addon
+ * itself ships are score presets: `Presets/FFmpeg filter/*.scp`.
  */
 class LibraryHandler final
     : public QObject
@@ -43,21 +47,11 @@ public:
     QFile f{path};
     if(!f.open(QIODevice::ReadOnly))
       return {};
-    // One graph per file, possibly over several lines: lines are chained as
-    // filters unless the previous one already ends the chain element.
-    QString graph;
-    for(const auto& raw : QString::fromUtf8(f.readAll()).split('\n'))
-    {
-      const QString line = raw.trimmed();
-      if(line.isEmpty() || line.startsWith('#'))
-        continue;
-      if(!graph.isEmpty() && !graph.endsWith(',') && !graph.endsWith(';')
-         && !graph.endsWith('[') && !graph.endsWith(']') && !line.startsWith(',')
-         && !line.startsWith(';') && !line.startsWith('['))
-        graph += ',';
-      graph += line;
-    }
-    return graph;
+    // Comment stripping and line joining live in the core so that a file, a
+    // shipped preset and text typed in the editor all mean the same thing;
+    // the process runs it again on whatever it is given.
+    return QString::fromStdString(
+        Lavfi::Graph::preprocess(QString::fromUtf8(f.readAll()).toStdString()));
   }
 
   std::optional<Library::ProcessEntry> scanPath(std::string_view path) override

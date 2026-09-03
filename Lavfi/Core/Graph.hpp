@@ -132,6 +132,16 @@ public:
   Graph& operator=(const Graph&) = delete;
 
   /**
+   * @brief Turn human-written graph text into what libavfilter accepts.
+   *
+   * Strips whole-line '#' comments and joins the remaining lines, inserting
+   * ',' where neither side already separates them. describe() and init() both
+   * run this, so a preset, a .lavfi file and text typed in the script editor
+   * all behave the same. Exposed for tests and for the library file reader.
+   */
+  static std::string preprocess(const std::string& text);
+
+  /**
    * @brief Parse @p text and describe it, without configuring anything.
    * @return false on parse error, with @p error filled from the log.
    */

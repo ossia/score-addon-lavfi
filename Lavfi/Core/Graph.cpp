@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cctype>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
@@ -213,6 +214,53 @@ void Graph::destroy()
   m_eof = false;
 }
 
+std::string Graph::preprocess(const std::string& text)
+{
+  // libavfilter's parser has no notion of comments and treats a newline as an
+  // ordinary character, so "hflip\nvflip" is one filter named "hflip\nvflip".
+  // Every way a graph reaches us is written by a human on several lines with
+  // notes: a shipped preset, a .lavfi file, the script editor. Normalising
+  // here rather than in the library file reader is what makes those three
+  // agree -- pasting a preset's text into the editor used to fail where the
+  // same text loaded from a file worked.
+  //
+  //  - a line whose first non-blank character is '#' is a comment. Only at the
+  //    start of a line: '#' inside a line is a colour ("color=#ff0000"), which
+  //    av_parse_color accepts and which must survive untouched.
+  //  - lines are joined with ',' (chaining the filters) unless either side
+  //    already carries the separator, so a chain may be split over lines and a
+  //    graph may put each labelled branch on its own line.
+  std::string out;
+  std::size_t pos = 0;
+  while(pos <= text.size())
+  {
+    const std::size_t nl = text.find('\n', pos);
+    std::string_view line{
+        text.data() + pos, (nl == std::string::npos ? text.size() : nl) - pos};
+    pos = (nl == std::string::npos) ? text.size() + 1 : nl + 1;
+
+    const auto notSpace = [](char c) { return !std::isspace(static_cast<unsigned char>(c)); };
+    while(!line.empty() && !notSpace(line.front()))
+      line.remove_prefix(1);
+    while(!line.empty() && !notSpace(line.back()))
+      line.remove_suffix(1);
+    if(line.empty() || line.front() == '#')
+      continue;
+
+    if(!out.empty())
+    {
+      const char prev = out.back();
+      const char next = line.front();
+      const bool joined = prev == ',' || prev == ';' || prev == '[' || prev == ']'
+                          || next == ',' || next == ';' || next == '[';
+      if(!joined)
+        out += ',';
+    }
+    out += line;
+  }
+  return out;
+}
+
 bool Graph::describe(const std::string& text, Description& out, std::string& error)
 {
   Graph g;
@@ -274,8 +322,9 @@ bool Graph::build(
   };
 
   // --- parse -> create -> options -> (hw device) -> init -> link -----------
+  const std::string source = preprocess(text);
   AVFilterGraphSegment* seg = nullptr;
-  int ret = avfilter_graph_segment_parse(m_graph, text.c_str(), 0, &seg);
+  int ret = avfilter_graph_segment_parse(m_graph, source.c_str(), 0, &seg);
   if(ret < 0)
     return fail("parse error", ret);
   struct SegGuard
@@ -459,7 +508,12 @@ bool Graph::build(
     m_outputs.push_back(out);
   }
 
-  if((ret = avfilter_graph_config(m_graph, nullptr)) < 0)
+  // m_graph, not nullptr, as the log context: format-negotiation errors
+  // ("Impossible to convert between the formats supported by ...") are logged
+  // against whatever is passed here. With nullptr they reached the terminal
+  // through the default callback instead of this graph's captured log, so the
+  // reason a graph was refused never made it into the error string.
+  if((ret = avfilter_graph_config(m_graph, m_graph)) < 0)
     return fail("could not configure the graph", ret);
 
   // Re-collect: config may have inserted auto-conversion filters and

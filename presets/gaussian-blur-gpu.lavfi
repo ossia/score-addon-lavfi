@@ -1,2 +1,0 @@
-# Gaussian blur on the GPU (Vulkan). sigma is a runtime control.
-gblur_vulkan=sigma=4

@@ -2,7 +2,9 @@
 // Run: score_addon_lavfi_graph_test ; exit code 0 on success.
 #include <Lavfi/Core/Graph.hpp>
 
+#include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -321,6 +323,265 @@ static void test_log_capture()
   CHECK(!err.empty());
 }
 
+
+// ---------------------------------------------------------------------------
+// Every shipped preset. A preset that cannot even be configured is worse than
+// no preset: the process appears in the library, the user picks it, and gets
+// an empty node. So each .scp is read, its graph text taken out of Key.Effect
+// (comments and line breaks included: that text goes to the process exactly as
+// written) and run through describe() + init() with the pixel formats and the
+// hardware device the renderer would give it.
+// ---------------------------------------------------------------------------
+#ifdef LAVFI_PRESET_DIR
+namespace
+{
+// Just enough JSON to read a preset: one string field, with the escapes
+// rapidjson writes (\", \\, \n, \t, \r, \uXXXX for the BMP).
+std::string json_string_field(const std::string& doc, const std::string& key)
+{
+  const auto k = "\"" + key + "\"";
+  auto i = doc.find(k);
+  if(i == std::string::npos)
+    return {};
+  i = doc.find(':', i + k.size());
+  if(i == std::string::npos)
+    return {};
+  i = doc.find('"', i);
+  if(i == std::string::npos)
+    return {};
+  std::string out;
+  for(++i; i < doc.size() && doc[i] != '"'; ++i)
+  {
+    if(doc[i] != '\\')
+    {
+      out += doc[i];
+      continue;
+    }
+    switch(doc[++i])
+    {
+      case 'n': out += '\n'; break;
+      case 't': out += '\t'; break;
+      case 'r': break;
+      case 'u': {
+        const int cp = int(std::strtol(doc.substr(i + 1, 4).c_str(), nullptr, 16));
+        i += 4;
+        if(cp < 0x80)
+          out += char(cp);
+        else if(cp < 0x800)
+        {
+          out += char(0xC0 | (cp >> 6));
+          out += char(0x80 | (cp & 0x3F));
+        }
+        else
+        {
+          out += char(0xE0 | (cp >> 12));
+          out += char(0x80 | ((cp >> 6) & 0x3F));
+          out += char(0x80 | (cp & 0x3F));
+        }
+        break;
+      }
+      default: out += doc[i]; break;
+    }
+  }
+  return out;
+}
+
+const std::vector<AVPixelFormat> uploadable_formats{
+    AV_PIX_FMT_RGBA,     AV_PIX_FMT_BGRA,      AV_PIX_FMT_RGB0,      AV_PIX_FMT_BGR0,
+    AV_PIX_FMT_RGB24,    AV_PIX_FMT_YUV420P,   AV_PIX_FMT_YUVJ420P,  AV_PIX_FMT_NV12,
+    AV_PIX_FMT_YUV422P,  AV_PIX_FMT_YUV444P,   AV_PIX_FMT_YUVA420P,  AV_PIX_FMT_YUVA444P,
+    AV_PIX_FMT_GRAY8,    AV_PIX_FMT_YUV420P10, AV_PIX_FMT_YUV444P10, AV_PIX_FMT_RGBA64,
+    AV_PIX_FMT_GBRP,     AV_PIX_FMT_GBRAP};
+
+// The device the renderer hands the graph: Vulkan where score renders with it,
+// and a CUDA device derived from it for the *_cuda filters.
+AVBufferRef* preset_hw_device(const std::string& text)
+{
+  const bool cuda = text.find("cuda") != std::string::npos;
+  const AVHWDeviceType type
+      = av_hwdevice_find_type_by_name(cuda ? "cuda" : "vulkan");
+  if(type == AV_HWDEVICE_TYPE_NONE)
+    return nullptr;
+  AVBufferRef* dev = nullptr;
+  if(av_hwdevice_ctx_create(&dev, type, nullptr, nullptr, 0) < 0)
+    return nullptr;
+  return dev;
+}
+}
+
+static void test_presets()
+{
+  namespace fs = std::filesystem;
+  const fs::path dir{LAVFI_PRESET_DIR};
+  if(!fs::exists(dir))
+  {
+    std::printf("  skip: preset directory not found (%s)\n", dir.string().c_str());
+    return;
+  }
+
+  int checked = 0, skipped = 0;
+  std::vector<fs::path> files;
+  for(const auto& de : fs::directory_iterator(dir))
+    if(de.path().extension() == ".scp")
+      files.push_back(de.path());
+  std::sort(files.begin(), files.end());
+
+  for(const auto& path : files)
+  {
+    std::string doc;
+    {
+      std::FILE* f = std::fopen(path.string().c_str(), "rb");
+      CHECK(f != nullptr);
+      if(!f)
+        continue;
+      char buf[4096];
+      std::size_t n;
+      while((n = std::fread(buf, 1, sizeof(buf), f)) > 0)
+        doc.append(buf, n);
+      std::fclose(f);
+    }
+    const std::string name = json_string_field(doc, "Name");
+    const std::string text = json_string_field(doc, "Effect");
+    const std::string file = path.filename().string();
+    CHECK(!name.empty());
+    CHECK(!text.empty());
+    if(text.empty())
+      continue;
+
+    // The uuid must be this process's, or the preset lands on another process.
+    CHECK(doc.find("3f0a1b6e-6a6b-4d0c-9d8f-2b3c1e7a9f10") != std::string::npos);
+
+    Lavfi::Description d;
+    std::string err;
+    if(!Lavfi::Graph::describe(text, d, err))
+    {
+      // A filter this FFmpeg was not built with is not a broken preset.
+      if(err.find("Filter not found") != std::string::npos)
+      {
+        std::printf("  skip %-28s (filter missing in this FFmpeg)\n", file.c_str());
+        skipped++;
+        continue;
+      }
+      std::fprintf(stderr, "FAIL preset %s: %s\n", file.c_str(), err.c_str());
+      failures++;
+      continue;
+    }
+    CHECK(!d.outputs.empty());
+
+    // Configure it the way the renderer/audio node would.
+    AVBufferRef* dev = preset_hw_device(text);
+    const bool needsHw = text.find("hwupload") != std::string::npos;
+    if(needsHw && !dev)
+    {
+      std::printf("  skip %-28s (no hardware device on this machine)\n", file.c_str());
+      skipped++;
+      continue;
+    }
+
+    std::vector<Lavfi::InputConfig> in;
+    for(const auto& pad : d.inputs)
+    {
+      Lavfi::InputConfig c;
+      c.type = pad.type;
+      if(pad.type == AVMEDIA_TYPE_VIDEO)
+      {
+        c.video.width = 320;
+        c.video.height = 240;
+        c.video.format = AV_PIX_FMT_RGBA;
+        c.video.time_base = {1, 1000000};
+        c.video.frame_rate = {60, 1};
+      }
+      else
+      {
+        c.audio.sample_rate = 48000;
+        c.audio.channels = 2;
+      }
+      in.push_back(c);
+    }
+    Lavfi::SinkConfig sinks;
+    sinks.pix_fmts = uploadable_formats;
+    sinks.sample_rate = 48000;
+    sinks.threads = 0;
+
+    Lavfi::Graph g;
+    if(!g.init(text, in, sinks, dev, err))
+    {
+      std::fprintf(stderr, "FAIL preset %s: %s\n", file.c_str(), err.c_str());
+      failures++;
+      av_buffer_unref(&dev);
+      continue;
+    }
+
+    // And it must actually produce something: one video frame, or one tick of
+    // audio, for a graph with no input; a graph with inputs gets fed first.
+    bool produced = false;
+    // Some filters need real time before they emit: ebur128 integrates over
+    // 400 ms and loudnorm buffers three seconds of lookahead, so an audio
+    // graph gets four seconds of material (at 512 samples a tick) before it
+    // is called silent. Video graphs get 96 frames -- nothing shipped here
+    // waits longer, and nlmeans/minterpolate are slow enough as it is.
+    const int ticks = g.outputType(0) == AVMEDIA_TYPE_AUDIO ? 400 : 96;
+    for(int i = 0; i < ticks && !produced; i++)
+    {
+      for(int k = 0; k < g.inputCount(); k++)
+      {
+        if(g.inputType(k) == AVMEDIA_TYPE_VIDEO)
+        {
+          AVFrame* f = av_frame_alloc();
+          f->format = AV_PIX_FMT_RGBA;
+          f->width = 320;
+          f->height = 240;
+          if(av_frame_get_buffer(f, 0) >= 0)
+          {
+            std::memset(f->data[0], 40 + 20 * i, std::size_t(f->linesize[0]) * 240);
+            f->pts = i * 16667;
+            g.pushVideo(k, f);
+          }
+          av_frame_free(&f);
+        }
+        else
+        {
+          std::vector<float> l(512), r(512);
+          for(int s = 0; s < 512; s++)
+            l[s] = r[s] = 0.25f * std::sin(2 * M_PI * 440. * (i * 512 + s) / 48000.);
+          const float* planes[2] = {l.data(), r.data()};
+          g.pushAudio(k, planes, 2, 512, i * 512);
+        }
+      }
+      if(g.outputType(0) == AVMEDIA_TYPE_VIDEO)
+      {
+        if(AVFrame* o = g.pullVideo(0))
+        {
+          produced = o->width > 0 && o->height > 0;
+          av_frame_free(&o);
+        }
+      }
+      else
+      {
+        std::vector<float> ol(512), orr(512);
+        float* planes[2] = {ol.data(), orr.data()};
+        produced = g.pullAudio(0, planes, 2, 512) > 0;
+      }
+    }
+    if(!produced)
+    {
+      std::fprintf(stderr, "FAIL preset %s: configured but produced nothing\n", file.c_str());
+      failures++;
+    }
+    else
+    {
+      std::printf(
+          "  ok   %-28s %zu in, %zu out, %zu control%s\n", file.c_str(), d.inputs.size(),
+          d.outputs.size(), d.options.size(), d.options.size() == 1 ? "" : "s");
+      checked++;
+    }
+    av_buffer_unref(&dev);
+  }
+  std::printf("  presets: %d ok, %d skipped\n", checked, skipped);
+  CHECK(checked > 0);
+}
+#endif
+
 int main()
 {
   test_describe();
@@ -330,6 +591,9 @@ int main()
   test_video_source();
   test_hw_graphs();
   test_log_capture();
+#ifdef LAVFI_PRESET_DIR
+  test_presets();
+#endif
   std::printf(
       "lavfi graph tests: %s (%d failure%s); vulkan filters: %s, cuda: %s, libplacebo: %s\n",
       failures ? "FAILED" : "ok", failures, failures == 1 ? "" : "s",

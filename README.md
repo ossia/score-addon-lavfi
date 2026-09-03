@@ -71,9 +71,31 @@ lavfi graph tests: ok (0 failures); vulkan filters: yes, cuda: yes, libplacebo: 
 
 ## Presets
 
-`presets/*.lavfi` are graph strings with `#` comments. Copy the folder into
-your score user library: each file becomes a preset of the process, and
-`.lavfi` files can be dropped on a scenario.
+`Presets/FFmpeg filter/*.scp` are score presets: video and audio effects,
+generators, analysers, and the GPU ones. Copy the `Presets` folder into your
+score user library (the one the Library settings point at) and they appear
+under the process in the library panel.
+
+Their graph text is written the way a person writes it, over several lines with
+`#` comments, and that is also what is put in the script editor when the preset
+is used. libavfilter accepts neither, so `Lavfi::Graph::preprocess` strips
+whole-line comments and joins the lines before parsing. `#` inside a line is
+left alone: that is a colour (`color=#ff0000`).
+
+A `.lavfi` file anywhere in the library is the same thing without the score
+preset wrapper: one graph per file, and it can be dropped on a scenario.
+
+Two tests cover them:
+
+```
+$ score_addon_lavfi_graph_test          # every preset against libavfilter alone
+$ tests/run-presets.sh /path/to/ossia-score   # every preset in a real score
+```
+
+The second creates each preset's process in a document, checks the ports it
+built, then plays all of them at once for two seconds. A preset whose filters
+the local FFmpeg was not built with (`v360_vulkan` before FFmpeg 7, say) is
+reported as skipped, not failed.
 
 ## Layout
 
@@ -82,7 +104,7 @@ Lavfi/Core/Graph.*          Qt-free libavfilter wrapper: describe, init, push/pu
 Lavfi/Process.*             the score process: script property, ports derived from the graph
 Lavfi/Layer.hpp             script editor dialog
 Lavfi/Commands.hpp          undoable graph edit (cables of dropped ports are restored)
-Lavfi/Library.hpp           .lavfi presets in the library, drag and drop
+Lavfi/Library.hpp           .lavfi files in the library, drag and drop
 Lavfi/Executor.*            picks the execution backend, live reload
 Lavfi/AudioNode.*           ossia node for audio graphs
 Lavfi/Node.*                gfx node + renderer for video graphs, transport ladder
@@ -90,6 +112,8 @@ Lavfi/Gfx/HwDevice.*        FFmpeg device contexts: Vulkan over QRhi (tested), C
 Lavfi/Gfx/VulkanTransport.* the zero-copy transport
 tests/GraphTest.cpp         headless tests (CPU, Vulkan and CUDA graphs through the wrapper)
 tests/VulkanTransportTest.cpp GPU test: pool image <-> QRhi <-> hflip_vulkan, pixel-checked
+tests/presets.js            every preset through score itself (--script), tests/run-presets.sh runs it
+Presets/FFmpeg filter/*.scp the shipped presets
 ```
 
 Build like any score addon: clone into `score/src/addons/` for an in-tree
