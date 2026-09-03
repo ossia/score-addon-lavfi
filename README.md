@@ -85,17 +85,32 @@ left alone: that is a colour (`color=#ff0000`).
 A `.lavfi` file anywhere in the library is the same thing without the score
 preset wrapper: one graph per file, and it can be dropped on a scenario.
 
-Two tests cover them:
+Four tests cover them, each answering a different question:
 
 ```
-$ score_addon_lavfi_graph_test          # every preset against libavfilter alone
-$ tests/run-presets.sh /path/to/ossia-score   # every preset in a real score
+$ score_addon_lavfi_graph_test                # does every preset configure and emit?
+$ score_addon_lavfi_preset_test               # does it do what it says?
+$ score_addon_lavfi_gfx_test                  # does the picture reach the screen?
+$ tests/run-presets.sh /path/to/ossia-score   # does score build and run them?
 ```
 
-The second creates each preset's process in a document, checks the ports it
-built, then plays all of them at once for two seconds. A preset whose filters
-the local FFmpeg was not built with (`v360_vulkan` before FFmpeg 7, say) is
-reported as skipped, not failed.
+The behaviour test feeds each preset material chosen for it and checks the
+values that come back: the negated picture is the inverse of the input, the
+8 kHz tone is gone after the 4 kHz low-pass, the pixelator leaves flat 16x16
+blocks, the loudness meter reports the level it was fed. The gfx test renders
+source shader to lavfi node to an offscreen sink on every backend the machine
+has and checks the read-back pixels. The script test creates each preset's
+process in a real document through `--script`, checks the ports it built, and
+plays all of them at once.
+
+A preset whose filters the local FFmpeg was not built with (`v360_vulkan`
+before FFmpeg 7) is reported as skipped, not failed.
+
+One thing worth knowing when writing a graph for the Vulkan transport: a filter
+that only rewrites strides rather than reading pixels, `vflip` being the one
+that bites, will happily accept a hardware frame and leave it untouched, since
+what it flips is a pointer to a `VkImage`. Anything that has to look at the
+pixels makes libavfilter insert the download and upload it needs.
 
 ## Layout
 

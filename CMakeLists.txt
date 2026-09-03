@@ -112,6 +112,28 @@ if(SCORE_LAVFI_GPU_TESTS AND NOT EMSCRIPTEN AND EXISTS "${CMAKE_CURRENT_SOURCE_D
     score_addon_lavfi score_plugin_gfx score_plugin_media ${QT_PREFIX}::Gui)
 endif()
 
+# The render pipeline itself: source node -> lavfi node -> offscreen sink, with
+# the pixels checked. Uses score's own gfx test fixture, so it only exists in a
+# score build that has the test tree (score_add_test comes from the same place).
+# score_add_test and Catch2 are available while src/ is being configured;
+# score_test_fixtures itself only appears later, in tests/, which is fine:
+# CMake resolves a link to a target defined later in the same project.
+if(COMMAND score_add_test AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/GfxPresetTest.cpp")
+  score_add_test(score_addon_lavfi_gfx_test
+    SOURCES tests/GfxPresetTest.cpp
+    GUI
+    PLUGINS score_plugin_gfx score_plugin_scenario score_lib_process
+    LIBS score_addon_lavfi ${QT_PREFIX}::Gui avfilter avutil)
+  target_include_directories(score_addon_lavfi_gfx_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    # score_test_fixtures carries this include dir, but it is declared after
+    # us, so its INTERFACE properties are not there to inherit yet.
+    "${SCORE_ROOT_SOURCE_DIR}/tests/fixtures")
+  # The source pictures come from score's own shader corpus.
+  target_compile_definitions(score_addon_lavfi_gfx_test PRIVATE
+    GFX_TEST_CORPUS_DIR="${SCORE_ROOT_SOURCE_DIR}/tests/gfx/corpus")
+endif()
+
 if(COMMAND add_test AND TARGET score_addon_lavfi_graph_test)
   add_test(NAME score_addon_lavfi_graph_test COMMAND score_addon_lavfi_graph_test)
   if(TARGET score_addon_lavfi_preset_test)

@@ -832,6 +832,11 @@ void GfxRenderer::update(
       }
     }
     m_decoder->exec(renderer, res, *f);
+    // The software decoders do not raise this themselves: score's own video
+    // renderers set it after exec() and gate their render pass on it, and so
+    // do we (runRenderPass). Without it the pass never draws and the node
+    // shows black however well the graph runs.
+    m_decoder->hasFrame = true;
     if(m_decoder->formatChanged)
     {
       rebuildPasses(renderer); // the decoder replaced its textures
