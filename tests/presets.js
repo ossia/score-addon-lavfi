@@ -123,12 +123,23 @@ for(const path of files)
 }
 
 // A second pass over the same processes: a preset must survive being saved and
-// read back, which is what happens to every score that uses one.
+// read back, which is what happens to every score that uses one. loadPreset
+// goes through Process::Preset::fromJson -- the same call the library makes on
+// every .scp it finds -- and then through the process's own loadPreset, which
+// for a script process restores the control values (the graph itself travels
+// in Key.Effect and is applied when the process is created from the preset,
+// exactly as in the Faust and JS processes).
 for(const proc of made)
 {
   const json = Score.savePreset(proc);
   if(!json || json.indexOf(UUID) < 0)
+  {
     failures.push("savePreset produced nothing usable for one of the processes");
+    continue;
+  }
+  Score.loadPreset(proc, json);
+  if(Score.savePreset(proc) !== json)
+    failures.push("a preset did not survive save -> load -> save");
 }
 
 console.info(
