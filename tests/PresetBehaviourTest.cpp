@@ -417,6 +417,15 @@ bool hardwarePathWorks(const std::string& text, AVBufferRef* dev)
   return ok;
 }
 
+/// The driver said no: AVERROR_EXTERNAL comes back as this. Under a sanitizer
+/// the CUDA driver reports out of memory at cuInit and every kernel load
+/// fails; that is the machine, not the preset.
+bool driverRefused(const std::string& err)
+{
+  return err.find("external library") != std::string::npos
+         || err.find("Cannot allocate memory") != std::string::npos;
+}
+
 bool needsHardware(const std::string& text)
 {
   return text.find("hwupload") != std::string::npos;
@@ -433,6 +442,15 @@ Result run(const Job& job)
     {
       res.skipped = true;
       res.error = "a filter this FFmpeg does not have";
+      return res;
+    }
+    // describe() initialises the filters as well, so this is also where a
+    // driver that will not start says so: under a sanitizer CUDA reports out
+    // of memory at cuInit and every kernel load fails.
+    if(needsHardware(job.text) && driverRefused(err))
+    {
+      res.skipped = true;
+      res.error = "the driver refused: " + err;
       return res;
     }
     res.error = err;
@@ -483,7 +501,7 @@ Result run(const Job& job)
   Lavfi::Graph g;
   if(!g.init(job.text, inputs, sinks, dev, err))
   {
-    if(needsHardware(job.text) && !hardwarePathWorks(job.text, dev))
+    if(needsHardware(job.text) && (driverRefused(err) || !hardwarePathWorks(job.text, dev)))
     {
       res.skipped = true;
       res.error = "the hardware path does not work here";

@@ -447,6 +447,15 @@ bool hardwarePathWorks(const std::string& text, AVBufferRef* dev)
   return ok;
 }
 
+/// The driver said no: AVERROR_EXTERNAL comes back as this. Under a sanitizer
+/// the CUDA driver reports out of memory at cuInit and every kernel load
+/// fails; that is the machine, not the preset.
+bool driverRefused(const std::string& err)
+{
+  return err.find("external library") != std::string::npos
+         || err.find("Cannot allocate memory") != std::string::npos;
+}
+
 AVBufferRef* preset_hw_device(const std::string& text)
 {
   const bool cuda = text.find("cuda") != std::string::npos;
@@ -516,6 +525,14 @@ static void test_presets()
         skipped++;
         continue;
       }
+      // describe() initialises the filters, so a driver that will not start
+      // fails here rather than at configure time.
+      if(text.find("hwupload") != std::string::npos && driverRefused(err))
+      {
+        std::printf("  skip %-28s (the driver refused)\n", file.c_str());
+        skipped++;
+        continue;
+      }
       std::fprintf(stderr, "FAIL preset %s: %s\n", file.c_str(), err.c_str());
       failures++;
       continue;
@@ -560,7 +577,7 @@ static void test_presets()
     Lavfi::Graph g;
     if(!g.init(text, in, sinks, dev, err))
     {
-      if(needsHw && !hardwarePathWorks(text, dev))
+      if(needsHw && (driverRefused(err) || !hardwarePathWorks(text, dev)))
       {
         std::printf("  skip %-28s (the hardware path does not work here)\n", file.c_str());
         skipped++;
