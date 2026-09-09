@@ -767,10 +767,8 @@ void GfxRenderer::publishMetadata()
   map.reserve(md.size());
   for(const auto& [k, v] : md)
   {
-    double d{};
-    auto [p, ec] = std::from_chars(v.data(), v.data() + v.size(), d);
-    ossia::value val = (ec == std::errc{} && p == v.data() + v.size()) ? ossia::value{float(d)}
-                                                                          : ossia::value{v};
+    const auto num = Lavfi::parseNumber(v);
+    ossia::value val = num ? ossia::value{float(*num)} : ossia::value{v};
     map.emplace_back(k, std::move(val));
   }
   prog.metadata->post(ossia::value{std::move(map)});

@@ -317,10 +317,8 @@ void audio_node::run(const ossia::token_request& t, ossia::exec_state_facade st)
       for(const auto& [k, v] : m_graph->lastMetadata(o))
       {
         // Numeric where it parses as such, string otherwise.
-        double d{};
-        auto [p, ec] = std::from_chars(v.data(), v.data() + v.size(), d);
-        ossia::value val = (ec == std::errc{} && p == v.data() + v.size()) ? ossia::value{float(d)}
-                                                                              : ossia::value{v};
+        const auto num = Lavfi::parseNumber(v);
+        ossia::value val = num ? ossia::value{float(*num)} : ossia::value{v};
         map.emplace_back(k, std::move(val));
       }
     if(!map.empty())
