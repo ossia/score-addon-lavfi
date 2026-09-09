@@ -31,10 +31,7 @@
 #include <Lavfi/Export.hpp>
 
 #include <cstdint>
-#include <locale>
 #include <memory>
-#include <optional>
-#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -51,34 +48,6 @@ extern "C" {
 
 namespace Lavfi
 {
-/**
- * @brief Parse a metadata value as a number, or report that it is not one.
- *
- * Metadata arrives as text and is published as a number where it reads as one.
- * `std::from_chars` would be the natural tool, but libc++ leaves its
- * floating-point overloads deleted on some platforms -- a FreeBSD build stops
- * at "call to deleted function 'from_chars'". `strtod` is available everywhere
- * but follows `LC_NUMERIC`, so under a locale whose decimal separator is a
- * comma it would stop at the '.' in "0.5" and report it as text. A stream
- * imbued with the classic locale is portable and locale-independent both.
- *
- * The whole string must be consumed, so "1.5 dB" is text, not 1.5.
- */
-inline std::optional<double> parseNumber(const std::string& v) noexcept
-{
-  if(v.empty())
-    return std::nullopt;
-
-  std::istringstream is(v);
-  is.imbue(std::locale::classic());
-
-  double d{};
-  is >> d;
-  if(!is || is.peek() != std::char_traits<char>::eof())
-    return std::nullopt;
-  return d;
-}
-
 
 /// One open (unconnected) pad of the parsed graph. It becomes a score port.
 struct PadInfo

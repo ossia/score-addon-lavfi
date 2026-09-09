@@ -4,6 +4,8 @@
 #include <ossia/network/value/value_conversion.hpp>
 
 #include <algorithm>
+#include <Lavfi/ParseNumber.hpp>
+
 #include <charconv>
 #include <cstdio>
 

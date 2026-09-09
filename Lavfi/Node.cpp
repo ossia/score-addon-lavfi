@@ -14,7 +14,8 @@
 
 #include <QDebug>
 
-#include <charconv>
+#include <Lavfi/ParseNumber.hpp>
+
 #include <cstring>
 
 extern "C" {
