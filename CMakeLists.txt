@@ -23,6 +23,36 @@ if(NOT TARGET avfilter)
   return()
 endif()
 
+# Being present is not enough: the graph wrapper needs the segment API
+# (avfilter_graph_segment_*), which arrived in lavfi 9.7 / FFmpeg 6.1 and is
+# what lets hw_device_ctx reach a filter before its init(). Core/Graph.cpp says
+# the same thing with #error, so a distribution that ships an older FFmpeg --
+# Debian bookworm, for one -- would otherwise configure happily and then fail
+# the build. Asked of the header rather than of a pkg-config version variable,
+# which is only set when the component was found that way.
+include(CheckCXXSourceCompiles)
+set(_lavfi_saved_includes "${CMAKE_REQUIRED_INCLUDES}")
+get_target_property(_lavfi_incs avfilter INTERFACE_INCLUDE_DIRECTORIES)
+if(_lavfi_incs)
+  list(APPEND CMAKE_REQUIRED_INCLUDES ${_lavfi_incs})
+endif()
+check_cxx_source_compiles("
+extern \"C\" {
+#include <libavfilter/version.h>
+#include <libavutil/version.h>
+}
+#if LIBAVFILTER_VERSION_INT < AV_VERSION_INT(9, 7, 100)
+#error \"libavfilter is older than 9.7\"
+#endif
+int main() { return 0; }
+" SCORE_LAVFI_HAS_SEGMENT_API)
+set(CMAKE_REQUIRED_INCLUDES "${_lavfi_saved_includes}")
+
+if(NOT SCORE_LAVFI_HAS_SEGMENT_API)
+  message(STATUS "score-addon-lavfi: libavfilter is older than 9.7 (FFmpeg 6.1), skipping")
+  return()
+endif()
+
 project(score_addon_lavfi LANGUAGES CXX)
 
 score_common_setup()
