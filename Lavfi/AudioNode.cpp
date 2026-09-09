@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <Lavfi/ParseNumber.hpp>
 
-#include <charconv>
 #include <cstdio>
 
 namespace Lavfi
@@ -16,10 +15,7 @@ std::string commandArgument(const ossia::value& v)
   switch(v.get_type())
   {
     case ossia::val_type::FLOAT: {
-      // std::to_chars: shortest round-trip text, locale independent.
-      char buf[64];
-      auto [p, ec] = std::to_chars(buf, buf + sizeof(buf), *v.target<float>());
-      return ec == std::errc{} ? std::string(buf, p) : std::to_string(*v.target<float>());
+      return Lavfi::formatNumber(*v.target<float>());
     }
     case ossia::val_type::INT:
       return std::to_string(*v.target<int>());

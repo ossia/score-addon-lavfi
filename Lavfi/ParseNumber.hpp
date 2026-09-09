@@ -27,7 +27,14 @@
 #include <charconv>
 #else
 #include <boost/lexical_cast/try_lexical_convert.hpp>
+
+#include <iomanip>
+#include <limits>
+#include <locale>
+#include <sstream>
 #endif
+
+#include <string>
 
 namespace Lavfi
 {
@@ -66,5 +73,58 @@ inline std::optional<double> parseNumber(std::string_view text) noexcept
   }
 #endif
   return out;
+}
+
+/**
+ * @brief Render a float as text that reads back as the same value.
+ *
+ * std::to_chars gives the shortest such text and ignores the locale, but its
+ * floating-point overloads carry the same availability problem as from_chars --
+ * on Apple they are annotated as introduced in macOS 13.3, past the deployment
+ * target. The fallback asks for max_digits10 through a classic-locale stream:
+ * not the shortest form, but it round-trips, and the decimal separator does not
+ * follow LC_NUMERIC the way std::to_string would.
+ */
+inline std::string formatNumber(float f)
+{
+#if SCORE_HAS_STD_FLOAT_FROM_CHARS
+  char buf[64];
+  const auto [p, ec] = std::to_chars(buf, buf + sizeof(buf), f);
+  if(ec == std::errc{})
+    return std::string(buf, p);
+  return std::to_string(f);
+#else
+  // Shortest text that still reads back as f, so the two branches agree.
+  // max_digits10 alone would always print nine significant digits and turn 0.1
+  // into "0.100000001"; taking the FIRST precision that round-trips is not
+  // enough either, because the stream switches to scientific at low precision
+  // and would render 16000 as "1.6e+04". to_chars picks the shortest form, so
+  // this keeps the shortest round-tripping candidate rather than the first.
+  std::string best;
+  for(int prec = 1; prec <= std::numeric_limits<float>::max_digits10; ++prec)
+  {
+    std::ostringstream os;
+    os.imbue(std::locale::classic());
+    os << std::setprecision(prec) << f;
+    const auto candidate = os.str();
+
+    float back{};
+    std::istringstream is(candidate);
+    is.imbue(std::locale::classic());
+    is >> back;
+    if(!is || back != f)
+      continue;
+
+    if(best.empty() || candidate.size() < best.size())
+      best = candidate;
+  }
+  if(!best.empty())
+    return best;
+
+  std::ostringstream os;
+  os.imbue(std::locale::classic());
+  os << std::setprecision(std::numeric_limits<float>::max_digits10) << f;
+  return os.str();
+#endif
 }
 }
