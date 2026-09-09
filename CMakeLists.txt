@@ -76,10 +76,17 @@ target_link_libraries(score_addon_lavfi PUBLIC
 setup_score_plugin(score_addon_lavfi)
 
 # --- tests ------------------------------------------------------------------
-# Headless test of the wrapper: no Qt, no score, no GPU. Not gated on
-# BUILD_TESTING: score's own tests are opt-in per target and this one is tiny,
-# but it must not break an SDK build, where CTest is not set up.
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/GraphTest.cpp")
+# Headless tests of the wrapper: no Qt, no score, no GPU.
+#
+# Gated on SCORE_TESTING, which only the coverage job sets, and that job builds
+# against the distribution's shared FFmpeg. They cannot be built against the
+# SDK's static FFmpeg: linking `avfilter avutil` there leaves the rest of the
+# archives' dependency closure unresolved -- libavfilter.a(af_pan.o) wants
+# swr_*, libavutil.a(hwcontext_{drm,vulkan}.o) wants drm*, libavcodec.a
+# (hapenc.o) wants snappy_*, and udev_* goes unresolved too. score's own
+# targets get all of that through score_plugin_media and score_plugin_gfx;
+# these deliberately link neither, so they stay out of packaging builds.
+if(SCORE_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/GraphTest.cpp")
   add_executable(score_addon_lavfi_graph_test tests/GraphTest.cpp ${LAVFI_CORE_SOURCES})
   target_include_directories(score_addon_lavfi_graph_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
   target_link_libraries(score_addon_lavfi_graph_test PRIVATE avfilter avutil)
@@ -93,7 +100,7 @@ endif()
 # What the presets DO: each one is fed material chosen for it and the output
 # frames or samples are checked against what the filter is supposed to have
 # done. Same dependencies as the graph test.
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/PresetBehaviourTest.cpp")
+if(SCORE_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/PresetBehaviourTest.cpp")
   add_executable(score_addon_lavfi_preset_test tests/PresetBehaviourTest.cpp ${LAVFI_CORE_SOURCES})
   target_include_directories(score_addon_lavfi_preset_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
   target_link_libraries(score_addon_lavfi_preset_test PRIVATE avfilter avutil)
