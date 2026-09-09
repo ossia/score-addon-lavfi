@@ -422,8 +422,13 @@ bool hardwarePathWorks(const std::string& text, AVBufferRef* dev)
 /// fails; that is the machine, not the preset.
 bool driverRefused(const std::string& err)
 {
+  // Kept in step with the same helper in GraphTest.cpp. AVERROR_EXTERNAL comes
+  // back as "external library"; a sanitized CUDA driver reports out of memory
+  // at cuInit; and an FFmpeg built with CUDA on a machine that has no CUDA
+  // device reports EPERM. None of those say anything about the preset.
   return err.find("external library") != std::string::npos
-         || err.find("Cannot allocate memory") != std::string::npos;
+         || err.find("Cannot allocate memory") != std::string::npos
+         || err.find("Operation not permitted") != std::string::npos;
 }
 
 bool needsHardware(const std::string& text)

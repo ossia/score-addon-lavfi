@@ -449,11 +449,14 @@ bool hardwarePathWorks(const std::string& text, AVBufferRef* dev)
 
 /// The driver said no: AVERROR_EXTERNAL comes back as this. Under a sanitizer
 /// the CUDA driver reports out of memory at cuInit and every kernel load
-/// fails; that is the machine, not the preset.
+/// fails, and a machine whose FFmpeg was built with CUDA but which has no CUDA
+/// device at all reports EPERM there. All of that is the machine, not the
+/// preset.
 bool driverRefused(const std::string& err)
 {
   return err.find("external library") != std::string::npos
-         || err.find("Cannot allocate memory") != std::string::npos;
+         || err.find("Cannot allocate memory") != std::string::npos
+         || err.find("Operation not permitted") != std::string::npos;
 }
 
 AVBufferRef* preset_hw_device(const std::string& text)
