@@ -34,10 +34,17 @@ log="$TMPDIR/score.log"
 trap 'rm -rf "$TMPDIR"' EXIT
 rm -f "$TMPDIR/score_open_docs.${USER:-$(id -un)}"
 
+# --no-restore is what every sibling runner in score/tests/integration passes
+# (soak-leak, golden-render, live-edit-sweep, timeline-scenario, ...): it sets
+# tryToRestore=false, so initDocuments never reaches canRestoreDocuments and the
+# modal cannot be raised at all. This runner was the ONLY one of the ten missing
+# it, which is exactly why it was the only one that ever hung. The private TMPDIR
+# above still earns its place: it stops this instance writing the shared marker
+# and inflicting the same hang on something else.
 LAVFI_PRESET_DIR="$here/../Presets/FFmpeg filter" \
 SCORE_AUDIO_BACKEND=${SCORE_AUDIO_BACKEND:-dummy} \
 QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-offscreen} \
-  timeout 300 "$score" --script "$here/presets.js" >"$log" 2>&1
+  timeout 300 "$score" --no-restore --script "$here/presets.js" >"$log" 2>&1
 
 grep -E '^(Info|Critical):' "$log" | sed -e 's/^Info: //' -e 's/^Critical: //' \
   | grep -Ev '^\s*$'
