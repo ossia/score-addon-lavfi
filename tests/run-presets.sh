@@ -20,12 +20,19 @@ if ! command -v "$score" >/dev/null 2>&1 && [[ ! -x "$score" ]]; then
   exit 77
 fi
 
-log=$(mktemp)
-trap 'rm -f "$log"' EXIT
-
-# A previous crash leaves a marker that makes score open a modal "reload?"
-# question at startup, which never returns without a user.
-rm -f "${TMPDIR:-/tmp}/score_open_docs.${USER:-$(id -un)}"
+# score decides whether to offer its modal "Reload?" question purely on whether
+# <TempLocation>/score_open_docs.$USER exists (DocumentBackups::canRestoreDocuments
+# -> score::question -> QDialog::exec). That path is GLOBAL PER USER, and score
+# leaves it behind every time, because it crashes on --script exit rather than
+# exiting cleanly. Deleting it here is therefore not enough: under `ctest -j` the
+# other score instances recreate it between that delete and our startup, we open
+# a dialog that no one can answer, and the run dies on the timeout below having
+# loaded no presets at all. Measured: 9s alone, >300s beside eight other GUI
+# tests, 11s beside the same eight with the private TMPDIR below.
+export TMPDIR=$(mktemp -d)
+log="$TMPDIR/score.log"
+trap 'rm -rf "$TMPDIR"' EXIT
+rm -f "$TMPDIR/score_open_docs.${USER:-$(id -un)}"
 
 LAVFI_PRESET_DIR="$here/../Presets/FFmpeg filter" \
 SCORE_AUDIO_BACKEND=${SCORE_AUDIO_BACKEND:-dummy} \
