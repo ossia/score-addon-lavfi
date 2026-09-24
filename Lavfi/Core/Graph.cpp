@@ -15,8 +15,10 @@ extern "C" {
 #include <libavutil/common.h>
 #include <libavcodec/defs.h>
 #include <libavutil/dict.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/log.h>
 #include <libavutil/mem.h>
+#include <libavutil/opt.h>
 #include <libavutil/parseutils.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/version.h>
@@ -394,6 +396,36 @@ bool Graph::build(
       AVFilterContext* f = m_graph->filters[i];
       if(!f->hw_device_ctx)
         f->hw_device_ctx = av_buffer_ref(hw_device);
+    }
+  }
+  // FFmpeg >= 8 refuses to init hwupload without a device (036336296c,
+  // "lavfi/vf_hwupload: validate the hw device in init"), so describe() failed
+  // for every graph containing it. hwupload_init only takes a reference; the
+  // device is first used by query_formats at configure time, which describe()
+  // never reaches. An allocated, never-initialised device is therefore enough
+  // here. Not for derive_device, which derives from it in init.
+  struct DeviceGuard
+  {
+    AVBufferRef* ref{};
+    ~DeviceGuard() { av_buffer_unref(&ref); }
+  } placeholder;
+  if(!hw_device && !configure)
+  {
+    for(unsigned i = 0; i < m_graph->nb_filters; i++)
+    {
+      AVFilterContext* f = m_graph->filters[i];
+      if(f->hw_device_ctx || std::strcmp(f->filter->name, "hwupload") != 0)
+        continue;
+      uint8_t* derive = nullptr;
+      const bool derives = av_opt_get(f, "derive_device", 0, &derive) >= 0 && derive
+                           && *derive;
+      av_free(derive);
+      if(derives)
+        continue;
+      if(!placeholder.ref)
+        placeholder.ref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_VULKAN);
+      if(placeholder.ref)
+        f->hw_device_ctx = av_buffer_ref(placeholder.ref);
     }
   }
   if((ret = avfilter_graph_segment_init(seg, 0)) < 0)
