@@ -264,9 +264,15 @@ static void test_hw_graph(const char* devname, const char* script, bool expectCu
     if(o)
     {
       CHECK(o->format == AV_PIX_FMT_RGBA);
-      // hflip: the first pixel is the input's last one (x=31 -> R=248).
-      const uint8_t* px = o->data[0];
-      CHECK(std::abs(int(px[0]) - 248) <= 2 && std::abs(int(px[1]) - 100) <= 2);
+      // hflip: mirrored, i.e. the ramp (R = x * 8) now decreases. Checked away
+      // from the edges: FFmpeg's vf_flip_vulkan maps x to size - x instead of
+      // size - 1 - x, which shifts the image by one pixel and reads out of
+      // bounds at column 0 (FFmpeg 9.0), so the edge pixel is not reliable.
+      const uint8_t* row = o->data[0];
+      const auto r = [row](int x) { return int(row[x * 4]); };
+      std::printf("  R at x=0,1,2,29: %d %d %d %d\n", r(0), r(1), r(2), r(29));
+      CHECK(r(2) > r(29) + 128);
+      CHECK(std::abs(int(row[2 * 4 + 1]) - 100) <= 2);
       av_frame_free(&o);
     }
     av_frame_free(&f);
