@@ -106,7 +106,9 @@ target_link_libraries(score_addon_lavfi PUBLIC
 setup_score_plugin(score_addon_lavfi)
 
 # --- tests ------------------------------------------------------------------
-# Headless tests of the wrapper: no Qt, no score, no GPU.
+# Headless tests of the wrapper: no Qt, no score. The graph and preset tests
+# also run the hardware (Vulkan, CUDA) graphs when a device is there, so they
+# are labelled "gpu" like every test that can touch a GPU.
 #
 # Gated on SCORE_TESTING, which only the coverage job sets, and that job builds
 # against the distribution's shared FFmpeg. They cannot be built against the
@@ -169,13 +171,16 @@ if(COMMAND score_add_test AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/GfxPrese
   # The source pictures come from score's own shader corpus.
   target_compile_definitions(score_addon_lavfi_gfx_test PRIVATE
     GFX_TEST_CORPUS_DIR="${SCORE_ROOT_SOURCE_DIR}/tests/gfx/corpus")
+  set_property(TEST score_addon_lavfi_gfx_test APPEND PROPERTY LABELS gpu)
 endif()
 
 if(COMMAND add_test AND TARGET score_addon_lavfi_graph_test)
   add_test(NAME score_addon_lavfi_graph_test COMMAND score_addon_lavfi_graph_test)
+  set_tests_properties(score_addon_lavfi_graph_test PROPERTIES LABELS "gpu")
   if(TARGET score_addon_lavfi_preset_test)
     add_test(NAME score_addon_lavfi_preset_test COMMAND score_addon_lavfi_preset_test)
-    set_tests_properties(score_addon_lavfi_preset_test PROPERTIES TIMEOUT 600)
+    set_tests_properties(score_addon_lavfi_preset_test PROPERTIES
+      TIMEOUT 600 LABELS "gpu")
   endif()
   # The same presets, but through score itself: the process model builds its
   # ports from the graph and the engine runs every one of them. The addons are
@@ -187,12 +192,12 @@ if(COMMAND add_test AND TARGET score_addon_lavfi_graph_test)
              COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/run-presets.sh"
                      "${CMAKE_BINARY_DIR}/ossia-score")
     set_tests_properties(score_addon_lavfi_presets PROPERTIES
-      LABELS "gui" TIMEOUT 400 SKIP_RETURN_CODE 77)
+      LABELS "gui;gpu" TIMEOUT 400 SKIP_RETURN_CODE 77)
   endif()
   if(TARGET score_addon_lavfi_vulkan_test)
     add_test(NAME score_addon_lavfi_vulkan_test COMMAND score_addon_lavfi_vulkan_test)
     set_tests_properties(score_addon_lavfi_vulkan_test PROPERTIES
       ENVIRONMENT "SCORE_AUDIO_BACKEND=dummy;ASAN_OPTIONS=detect_leaks=0:halt_on_error=0"
-      LABELS "gui")
+      LABELS "gui;gpu")
   endif()
 endif()
