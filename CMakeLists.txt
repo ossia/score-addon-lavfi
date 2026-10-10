@@ -118,7 +118,16 @@ setup_score_plugin(score_addon_lavfi)
 # (hapenc.o) wants snappy_*, and udev_* goes unresolved too. score's own
 # targets get all of that through score_plugin_media and score_plugin_gfx;
 # these deliberately link neither, so they stay out of packaging builds.
-if(SCORE_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/GraphTest.cpp")
+# SCORE_TESTING is also set on SDK builds that run score's own suite, so check
+# the FFmpeg that was found rather than who asked for the tests.
+set(LAVFI_SHARED_FFMPEG ON)
+if(AVFILTER_LIBRARIES MATCHES "\\.a$" AND NOT AVFILTER_LIBRARIES MATCHES "\\.dll\\.a$")
+  set(LAVFI_SHARED_FFMPEG OFF)
+  if(SCORE_TESTING)
+    message(STATUS "score-addon-lavfi: static FFmpeg, graph and preset tests not built")
+  endif()
+endif()
+if(SCORE_TESTING AND LAVFI_SHARED_FFMPEG AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/GraphTest.cpp")
   add_executable(score_addon_lavfi_graph_test tests/GraphTest.cpp ${LAVFI_CORE_SOURCES})
   target_include_directories(score_addon_lavfi_graph_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
   target_link_libraries(score_addon_lavfi_graph_test PRIVATE avfilter avutil)
@@ -132,7 +141,7 @@ endif()
 # What the presets DO: each one is fed material chosen for it and the output
 # frames or samples are checked against what the filter is supposed to have
 # done. Same dependencies as the graph test.
-if(SCORE_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/PresetBehaviourTest.cpp")
+if(SCORE_TESTING AND LAVFI_SHARED_FFMPEG AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/PresetBehaviourTest.cpp")
   add_executable(score_addon_lavfi_preset_test tests/PresetBehaviourTest.cpp ${LAVFI_CORE_SOURCES})
   target_include_directories(score_addon_lavfi_preset_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
   target_link_libraries(score_addon_lavfi_preset_test PRIVATE avfilter avutil)
@@ -145,7 +154,11 @@ endif()
 # device and a display; prints SKIP and exits 0 without one. Off by default
 # in SDK/addon CI builds (no GPU there), on where score builds its own testers.
 option(SCORE_LAVFI_GPU_TESTS "Build the lavfi Vulkan transport test" ${SCORE_TESTING})
-if(SCORE_LAVFI_GPU_TESTS AND NOT EMSCRIPTEN AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/VulkanTransportTest.cpp")
+# It includes Qt's private Vulkan RHI header: only where Qt has a Vulkan RHI
+# (not on macOS).
+get_target_property(_lavfi_qtgui_features ${QT_PREFIX}::Gui QT_ENABLED_PUBLIC_FEATURES)
+if(SCORE_LAVFI_GPU_TESTS AND NOT EMSCRIPTEN AND "vulkan" IN_LIST _lavfi_qtgui_features
+   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/VulkanTransportTest.cpp")
   add_executable(score_addon_lavfi_vulkan_test tests/VulkanTransportTest.cpp)
   target_link_libraries(score_addon_lavfi_vulkan_test PRIVATE
     score_addon_lavfi score_plugin_gfx score_plugin_media ${QT_PREFIX}::Gui)
