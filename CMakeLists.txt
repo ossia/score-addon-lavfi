@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.13 FATAL_ERROR)
+project(score_addon_lavfi LANGUAGES CXX)
 
 if(NOT TARGET score_lib_base)
   include(ScoreExternalAddon)
@@ -52,8 +53,6 @@ if(NOT SCORE_LAVFI_HAS_SEGMENT_API)
   message(STATUS "score-addon-lavfi: libavfilter is older than 9.7 (FFmpeg 6.1), skipping")
   return()
 endif()
-
-project(score_addon_lavfi LANGUAGES CXX)
 
 score_common_setup()
 
