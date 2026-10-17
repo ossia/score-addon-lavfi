@@ -1,7 +1,12 @@
 cmake_minimum_required(VERSION 3.13 FATAL_ERROR)
+project(score_addon_lavfi LANGUAGES CXX)
 
 if(NOT TARGET score_lib_base)
   include(ScoreExternalAddon)
+  set(LAVFI_EXTERNAL_BUILD ON)
+  if(EXISTS "${SCORE_SDK}")
+    set(LAVFI_SDK_BUILD ON)
+  endif()
 endif()
 
 if(EMSCRIPTEN)
@@ -12,15 +17,26 @@ if(NOT TARGET score_plugin_gfx OR NOT TARGET score_plugin_media)
   return()
 endif()
 
-# FindFFmpeg probes libavfilter and creates the imported target `avfilter`,
-# but deliberately keeps it out of FFMPEG_TARGETS (nothing in score links it),
-# so it may or may not exist depending on who ran find_package first.
-if(NOT TARGET avfilter)
-  find_package(FFmpeg COMPONENTS AVFILTER AVUTIL AVCODEC AVFORMAT SWSCALE SWRESAMPLE)
-endif()
-if(NOT TARGET avfilter)
-  message(STATUS "score-addon-lavfi: libavfilter not found, skipping")
-  return()
+if(LAVFI_SDK_BUILD)
+  find_path(LAVFI_AVFILTER_INCLUDE_DIR libavfilter/avfilter.h
+    HINTS "${SCORE_SDK}/include"
+    NO_DEFAULT_PATH)
+  if(NOT LAVFI_AVFILTER_INCLUDE_DIR)
+    message(STATUS "score-addon-lavfi: libavfilter headers not found in the score SDK, skipping")
+    return()
+  endif()
+else()
+  # FindFFmpeg probes libavfilter and creates the imported target `avfilter`,
+  # but deliberately keeps it out of FFMPEG_TARGETS (nothing in score links it),
+  # so it may or may not exist depending on who ran find_package first.
+  if(NOT TARGET avfilter)
+    find_package(FFmpeg COMPONENTS AVFILTER AVUTIL AVCODEC AVFORMAT SWSCALE SWRESAMPLE)
+  endif()
+  if(NOT TARGET avfilter)
+    message(STATUS "score-addon-lavfi: libavfilter not found, skipping")
+    return()
+  endif()
+  get_target_property(LAVFI_AVFILTER_INCLUDE_DIR avfilter INTERFACE_INCLUDE_DIRECTORIES)
 endif()
 
 # Being present is not enough: the graph wrapper needs the segment API
@@ -28,32 +44,30 @@ endif()
 # what lets hw_device_ctx reach a filter before its init(). Core/Graph.cpp says
 # the same thing with #error, so a distribution that ships an older FFmpeg --
 # Debian bookworm, for one -- would otherwise configure happily and then fail
-# the build. Asked of the header rather than of a pkg-config version variable,
-# which is only set when the component was found that way.
-include(CheckCXXSourceCompiles)
-set(_lavfi_saved_includes "${CMAKE_REQUIRED_INCLUDES}")
-get_target_property(_lavfi_incs avfilter INTERFACE_INCLUDE_DIRECTORIES)
-if(_lavfi_incs)
-  list(APPEND CMAKE_REQUIRED_INCLUDES ${_lavfi_incs})
-endif()
-check_cxx_source_compiles("
-extern \"C\" {
-#include <libavfilter/version.h>
-#include <libavutil/version.h>
-}
-#if LIBAVFILTER_VERSION_INT < AV_VERSION_INT(9, 7, 100)
-#error \"libavfilter is older than 9.7\"
-#endif
-int main() { return 0; }
-" SCORE_LAVFI_HAS_SEGMENT_API)
-set(CMAKE_REQUIRED_INCLUDES "${_lavfi_saved_includes}")
+# the build.
+set(_lavfi_version_text "")
+foreach(_lavfi_inc ${LAVFI_AVFILTER_INCLUDE_DIR})
+  foreach(_lavfi_hdr version_major.h version.h)
+    if(EXISTS "${_lavfi_inc}/libavfilter/${_lavfi_hdr}")
+      file(STRINGS "${_lavfi_inc}/libavfilter/${_lavfi_hdr}" _lavfi_lines
+        REGEX "^#define LIBAVFILTER_VERSION_(MAJOR|MINOR) ")
+      string(APPEND _lavfi_version_text "${_lavfi_lines};")
+    endif()
+  endforeach()
+endforeach()
+string(REGEX MATCH "LIBAVFILTER_VERSION_MAJOR +([0-9]+)" _ "${_lavfi_version_text}")
+set(LAVFI_AVFILTER_VERSION_MAJOR "${CMAKE_MATCH_1}")
+string(REGEX MATCH "LIBAVFILTER_VERSION_MINOR +([0-9]+)" _ "${_lavfi_version_text}")
+set(LAVFI_AVFILTER_VERSION_MINOR "${CMAKE_MATCH_1}")
 
-if(NOT SCORE_LAVFI_HAS_SEGMENT_API)
+if(LAVFI_AVFILTER_VERSION_MAJOR STREQUAL "" OR LAVFI_AVFILTER_VERSION_MINOR STREQUAL "")
+  message(STATUS "score-addon-lavfi: cannot read the libavfilter version, skipping")
+  return()
+endif()
+if("${LAVFI_AVFILTER_VERSION_MAJOR}.${LAVFI_AVFILTER_VERSION_MINOR}" VERSION_LESS 9.7)
   message(STATUS "score-addon-lavfi: libavfilter is older than 9.7 (FFmpeg 6.1), skipping")
   return()
 endif()
-
-project(score_addon_lavfi LANGUAGES CXX)
 
 score_common_setup()
 
@@ -78,8 +92,19 @@ set(LAVFI_HDRS
 )
 
 add_library(score_addon_lavfi
-  ${LAVFI_CORE_SOURCES}
-  ${LAVFI_HDRS}
+  Lavfi/Core/Graph.hpp
+  Lavfi/Core/Graph.cpp
+
+  Lavfi/Commands.hpp
+  Lavfi/Metadata.hpp
+  Lavfi/Process.hpp
+  Lavfi/Layer.hpp
+  Lavfi/Library.hpp
+  Lavfi/Executor.hpp
+  Lavfi/AudioNode.hpp
+  Lavfi/Node.hpp
+  Lavfi/Gfx/HwDevice.hpp
+  Lavfi/Gfx/VulkanTransport.hpp
 
   Lavfi/Process.cpp
   Lavfi/Executor.cpp
@@ -100,8 +125,15 @@ target_link_libraries(score_addon_lavfi PUBLIC
   score_plugin_engine
   score_plugin_scenario
   score_plugin_library
-  avfilter
 )
+
+if(NOT LAVFI_SDK_BUILD)
+  if(LAVFI_EXTERNAL_BUILD AND AVFILTER_LIBRARIES MATCHES "\\.a$" AND NOT AVFILTER_LIBRARIES MATCHES "\\.dll\\.a$")
+    target_include_directories(score_addon_lavfi SYSTEM PRIVATE ${LAVFI_AVFILTER_INCLUDE_DIR})
+  else()
+    target_link_libraries(score_addon_lavfi PUBLIC avfilter)
+  endif()
+endif()
 
 setup_score_plugin(score_addon_lavfi)
 
@@ -121,7 +153,9 @@ setup_score_plugin(score_addon_lavfi)
 # SCORE_TESTING is also set on SDK builds that run score's own suite, so check
 # the FFmpeg that was found rather than who asked for the tests.
 set(LAVFI_SHARED_FFMPEG ON)
-if(AVFILTER_LIBRARIES MATCHES "\\.a$" AND NOT AVFILTER_LIBRARIES MATCHES "\\.dll\\.a$")
+if(NOT TARGET avfilter)
+  set(LAVFI_SHARED_FFMPEG OFF)
+elseif(AVFILTER_LIBRARIES MATCHES "\\.a$" AND NOT AVFILTER_LIBRARIES MATCHES "\\.dll\\.a$")
   set(LAVFI_SHARED_FFMPEG OFF)
   if(SCORE_TESTING)
     message(STATUS "score-addon-lavfi: static FFmpeg, graph and preset tests not built")
