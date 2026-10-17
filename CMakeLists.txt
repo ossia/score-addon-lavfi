@@ -92,8 +92,19 @@ set(LAVFI_HDRS
 )
 
 add_library(score_addon_lavfi
-  ${LAVFI_CORE_SOURCES}
-  ${LAVFI_HDRS}
+  Lavfi/Core/Graph.hpp
+  Lavfi/Core/Graph.cpp
+
+  Lavfi/Commands.hpp
+  Lavfi/Metadata.hpp
+  Lavfi/Process.hpp
+  Lavfi/Layer.hpp
+  Lavfi/Library.hpp
+  Lavfi/Executor.hpp
+  Lavfi/AudioNode.hpp
+  Lavfi/Node.hpp
+  Lavfi/Gfx/HwDevice.hpp
+  Lavfi/Gfx/VulkanTransport.hpp
 
   Lavfi/Process.cpp
   Lavfi/Executor.cpp
